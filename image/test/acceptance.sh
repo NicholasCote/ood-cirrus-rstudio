@@ -288,6 +288,17 @@ podman exec "$NAME" bash -c '
   tr "\0" "\n" < /proc/$pid/environ | grep -qE "^LD_PRELOAD=" && echo "  ok   rsession has LD_PRELOAD (terminal identity works)" || echo "  FAIL rsession has no LD_PRELOAD"
 ' 2>/dev/null || printf '  note no rsession yet (nobody has opened the IDE in this run)\n'
 
+# rsession's log goes to the user's Console, not the pod log, so its level is set
+# per process rather than in logging.conf. At info the Console opens with three
+# INFO lines about keybinding files nobody installed.
+if podman exec "$NAME" bash -c '
+      pid=$(pgrep -x rsession | head -1); [ -n "$pid" ] || exit 9
+      tr "\0" "\n" < /proc/$pid/environ | grep -qx "RS_LOG_LEVEL=warn"' 2>/dev/null; then
+    ok "rsession runs at RS_LOG_LEVEL=warn (no INFO lines in the user's Console)"
+else
+    bad "rsession has no RS_LOG_LEVEL=warn; the Console will open with log lines"
+fi
+
 podman exec "$NAME" bash -c 'R -s -e "
   lib <- .libPaths()[1]
   cat(if (grepl(\"/home/ncote/rstudio/r-libs\", lib)) \"  ok   \" else \"  FAIL \", \"install target is \", lib, \"\n\", sep=\"\")

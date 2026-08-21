@@ -356,14 +356,50 @@ export CIRRUS_RSTUDIO_WORKDIR="$WORKDIR"
 #     ~/.Renviron overrides it.
 # ===========================================================================
 SESSION_ENV_FILE="${STATE_DIR}/session-env"
+
+# The R session's log level, which is not the server's.
+#
+# rsession's stderr is not the container's. rserver reads it and forwards it to
+# the browser, so every line the session logs is printed in the user's Console
+# above their first prompt -- verified on a live session, where rserver's fd 2 is
+# the pod's stderr and rsession's is a pipe rserver holds. At info that means
+# three lines about keybinding files nobody has installed:
+#
+#   INFO No keybindings/addins.json found at /etc/rstudio/keybindings/addins.json
+#   INFO No keybindings/rstudio_bindings.json found at ...
+#   INFO No keybindings/editor_bindings.json found at ...
+#
+# They are the normal state of a server with no site-wide keybinding overrides,
+# and they are the only part of the log a user ever sees.
+#
+# logging.conf cannot single the session out: a section name has to match the
+# logger name, and the session's is rsession-<username>, which is not knowable at
+# build time. Verified against this image -- [@rsession] and [rsession] both left
+# all three lines in place, [@rsession-ncote] removed them. So the level is set
+# per process instead, and rserver keeps info so the pod log keeps the startup
+# diagnostics that logging.conf argues for.
+#
+# warn, not error: a session that fails to start says why at ERROR, and a warning
+# in the Console is worth seeing.
+SESSION_LOG_LEVEL="${CIRRUS_RSTUDIO_SESSION_LOG_LEVEL:-warn}"
+case "$SESSION_LOG_LEVEL" in
+    debug|info|warn|warning|error) ;;
+    *)  warn "CIRRUS_RSTUDIO_SESSION_LOG_LEVEL=${SESSION_LOG_LEVEL} is not a level"
+        warn "rsession understands (debug|info|warn|warning|error); using warn."
+        SESSION_LOG_LEVEL=warn ;;
+esac
+
 {
     printf '# Written by entrypoint.sh; read by cirrus-rsession.\n'
+    printf 'RS_LOG_LEVEL=%s\n'   "$SESSION_LOG_LEVEL"
     printf 'XDG_CACHE_HOME=%s\n' "$XDG_CACHE_HOME"
     printf 'TMPDIR=%s\n'         "$TMPDIR"
     printf 'R_ENVIRON_USER=%s\n' "$R_ENVIRON_USER"
     printf 'USER=%s\n'           "${USER:-}"
     printf 'LOGNAME=%s\n'        "${LOGNAME:-${USER:-}}"
 } > "$SESSION_ENV_FILE"
+
+log "R session log level: ${SESSION_LOG_LEVEL} (rsession only -- its log is the user's Console)"
 
 # nss_wrapper has to be re-established for the session too. Without it the
 # Terminal tab runs as a uid with no name: the prompt shows a number, `whoami`
@@ -651,6 +687,7 @@ if [ "$MODE" = "bootstrap" ]; then
     log "  XDG_CACHE_HOME   : ${XDG_CACHE_HOME}"
     log "  working dir      : ${WORKDIR}"
     log "  session env      : ${SESSION_ENV_FILE}"
+    log "  session log level: ${SESSION_LOG_LEVEL} (rsession only; rserver stays at info)"
     log "  R site profile   : ${RPROFILE_SESSION}"
     log "  rsession.conf    : ${SESSION_CONF}"
     log "  proxy prefix     : ${BASE_URL} (gate login form only)"

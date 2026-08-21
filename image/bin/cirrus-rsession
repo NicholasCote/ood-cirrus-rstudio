@@ -38,7 +38,11 @@ if [ -r "$ENV_FILE" ]; then
             # An allowlist, not "export whatever is in the file". This process
             # is on the path between rserver and the user's R session; the only
             # things that belong in it are the ones rserver dropped.
-            LD_PRELOAD|NSS_WRAPPER_PASSWD|NSS_WRAPPER_GROUP|XDG_CACHE_HOME|TMPDIR|R_ENVIRON_USER|USER|LOGNAME)
+            # RS_LOG_LEVEL is the odd one out: rserver never had it to drop.
+            # It is here because rsession's log goes to the user's Console
+            # rather than to the pod log, and the level has to be set per
+            # process -- see the note where the entrypoint writes it.
+            RS_LOG_LEVEL|LD_PRELOAD|NSS_WRAPPER_PASSWD|NSS_WRAPPER_GROUP|XDG_CACHE_HOME|TMPDIR|R_ENVIRON_USER|USER|LOGNAME)
                 export "${name}=${value}" ;;
             *) ;;
         esac

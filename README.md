@@ -56,6 +56,16 @@ taken from documentation:
 - **`/etc/rstudio/logging.conf` ships `logger-type=syslog`.** There is no syslog
   in a container, so the error above lands nowhere and the pod looks like it
   exited for no reason. The image ships `logger-type=stderr`.
+- **`stderr` is two different destinations.** rserver's is the pod's, but the
+  session's is a pipe rserver reads and forwards to the browser, so anything
+  rsession logs is printed in the user's Console above their first prompt — at
+  `info`, three lines about keybinding files nobody has installed. A
+  `logging.conf` section cannot single the session out, because the section name
+  has to match the logger name and the session's is `rsession-<username>`
+  (`[@rsession]` and `[rsession]` were both verified to do nothing). So the
+  entrypoint sets `RS_LOG_LEVEL` for the session process alone, `warn` by
+  default, and rserver keeps `info` for the pod log. Override with
+  `CIRRUS_RSTUDIO_SESSION_LOG_LEVEL` when debugging a session.
 - **`/etc/rstudio/database.conf` ships mode 0600 owned by `rstudio-server`,**
   unreadable by the session's uid, with a sqlite directory under `/var/lib`
   it cannot write either. The image ships a readable one pointing at `/tmp`.
@@ -273,7 +283,7 @@ podman build -t localhost/cirrus-rstudio:dev -f image/Dockerfile image
 image/test/acceptance.sh
 ```
 
-Last run, 24 checks, all passing:
+Last run, 25 checks, all passing:
 
 ```
 == 1. arbitrary uid, runtime-synthesised numeric passwd entry ==
@@ -299,6 +309,7 @@ Last run, 24 checks, all passing:
   ok   data frame relayed through the gate: b'echo-through-gate'
 == 5. what the R session actually sees ==
   ok   rsession has LD_PRELOAD (terminal identity works)
+  ok   rsession runs at RS_LOG_LEVEL=warn (no INFO lines in the user's Console)
   ok   install target is /home/ncote/rstudio/r-libs/4.6
   ok   no HPC library path in .libPaths()
   ok   the user own ~/.Renviron settings survive
