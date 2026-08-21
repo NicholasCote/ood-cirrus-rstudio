@@ -1,18 +1,3 @@
-<%#
-  Rendered into the session card by the dashboard.
-
-  The binding here is the BatchConnect::Session, so user_context is available --
-  the launch form values, read back from user_defined_context.json. That is a
-  different binding from view.html.erb, which sees only the connection info and
-  the keys of <pod>-secret.
-
-  Keys are form attribute ids, so this tracks form.yml's `working_dir`.
-
-  Shown only when the user set one. "Working directory: your home" on every
-  default session is noise, and its absence is not ambiguous once the card is
-  known to call out a non-default choice and stay quiet otherwise -- which is how
-  the other CIRRUS apps read.
--%>
 <%- workdir = user_context["working_dir"].to_s.strip -%>
 <%- unless workdir.empty? -%>
 **Opens in:** `<%= workdir %>`

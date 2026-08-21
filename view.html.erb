@@ -1,35 +1,3 @@
-<%#
-  The Connect button.
-
-  Posts the session password to the gate that fronts RStudio and lands the user
-  in the IDE already signed in.
-
-  `password`, `host` and `port` come from the connection info the kubernetes
-  adapter assembles: host and port from the pod's node and the service's
-  NodePort, and password from the <pod>-secret written by the init-secret
-  container -- the adapter exposes every key of that Secret here. This template
-  cannot see the launch form at all, which is why nothing here depends on one;
-  info.md.erb is the template with user_context.
-
-  /rnode/, not /node/, and the two are not interchangeable. OnDemand's /node/
-  proxy forwards the whole path; /rnode/ strips its prefix on the way in and
-  prepends it again to every Location header and cookie Path on the way out.
-  RStudio needs the stripping one -- --www-root-path tells rserver what prefix to
-  EMIT, not what to expect on the way in, so pointed at /node/ every request
-  lands on RStudio's own 404 page.
-
-  Because /rnode/ does the putting-back itself, nothing inside the session is
-  told the prefix: rserver runs with no --www-root-path and the gate redirects to
-  "/". The one exception is right here. This is a response body, and the proxy
-  rewrites headers only, so the form action has to be the full path the browser
-  will resolve against the OnDemand host.
-
-  The POST goes to the gate rather than to RStudio's own /auth-do-sign-in,
-  because RStudio has no sign-in to do: running without privilege it signs the
-  caller in as the server user on request, never serving a login form and never
-  running a PAM helper. The password is enforced by the gate in front of it. See
-  /usr/local/bin/cirrus-rstudio-gate in the image.
--%>
 <form action="/rnode/<%= host %>/<%= port %>/cirrus-signin" method="post" target="_blank">
   <input type="hidden" name="password" value="<%= password %>">
   <button class="btn btn-primary" type="submit">
