@@ -370,9 +370,13 @@ the workflow. Tags are date stamps, `%Y-%m-%d.%H.%M`, pushed to
 `hub.k8s.ucar.edu/ncote/rstudio-server`.
 
 **`submit.yml.erb` pins one of those tags and must be updated by hand** to a tag
-that has been tested. The value there now is a placeholder written before the
-first CI run; set it to the tag CI publishes and re-test before announcing the
-app. Never point it at something floating.
+that has been tested. Set it to the tag CI publishes and re-test before
+announcing the app. Never point it at something floating.
+
+Because that step is manual, the run writes a job summary with the full
+reference, the `rstudio_img = "..."` line ready to paste, the pushed digest and
+the versions recorded in the image. It is the first thing on the run page, along
+with a notice annotation carrying the same reference.
 
 Harbor's Trivy scan cannot be run from here, so "no Criticals" is unverified —
 check it after the first push. The image does `apt-get upgrade` at build time,
