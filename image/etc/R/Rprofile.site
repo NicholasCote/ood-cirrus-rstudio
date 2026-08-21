@@ -1,0 +1,45 @@
+## Site profile for the CIRRUS RStudio image.
+##
+## This is where the session's R library path is actually established, and it
+## has to be here rather than in the environment for two independent reasons:
+##
+##   1. rserver does not pass its environment to the R session. It builds a
+##      filtered one -- RSTUDIO_CONFIG_HOME and XDG_CONFIG_HOME survive,
+##      R_LIBS, R_LIBS_USER, R_ENVIRON_USER, XDG_CACHE_HOME and LD_PRELOAD do
+##      not. Setting them in the entrypoint, or in /etc/rstudio/env-vars, gets
+##      them as far as rserver and no further. Verified by reading
+##      /proc/$(pgrep -x rsession)/environ.
+##
+##   2. Even where the environment does survive, a user's ~/.Renviron beats it.
+##      Verified: with R_LIBS_USER=/tmp/rlib in the environment and
+##      R_LIBS_USER=/glade/u/home/ncote/R/casper/4.4 in ~/.Renviron, R reports
+##      the Casper path. Anyone who has configured R on this platform has such
+##      a line.
+##
+## R's start-up order is what makes this work: Renviron.site, then ~/.Renviron,
+## then THIS file, then ~/.Rprofile. Setting the library path here therefore
+## wins over the user's ~/.Renviron -- which is the point, because a package
+## compiled in this image and installed into their Casper library is loaded by
+## HPC R against a different glibc and a different BLAS.
+##
+## Their own ~/.Rprofile still runs after this and can still do whatever it
+## likes, including changing .libPaths() back. That is their code, run
+## deliberately, and this image does not fight it.
+
+## The base image's own site profile, kept verbatim: it selects the Posit
+## Package Manager binary repository for Ubuntu noble, which is what makes
+## install.packages() fetch a prebuilt binary in seconds instead of compiling
+## from source for minutes. Losing it would be a large, silent regression.
+local({
+  rocker <- "/opt/cirrus-rstudio/Rprofile.site.rocker"
+  if (file.exists(rocker)) source(rocker)
+})
+
+## Written by entrypoint.sh at session start, because the paths depend on $HOME
+## and on the uid the pod was given -- neither of which exists at build time.
+## Absent (a plain `docker run` of this image with no entrypoint), R simply
+## behaves as the base image would.
+local({
+  session <- "/tmp/cirrus-rstudio/Rprofile.session"
+  if (file.exists(session)) source(session)
+})

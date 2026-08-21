@@ -1,0 +1,52 @@
+---
+cluster: "cirrus"
+
+form:
+  - working_dir
+  - cpu
+  - memory
+
+attributes:
+  working_dir:
+    widget: text_field
+    label: "Working directory"
+    value: ""
+    required: false
+    help: |
+      Absolute path RStudio opens in the Files pane and starts the console in.
+      Leave blank for your home directory. Only your home directory is mounted
+      into the session, so this must be a path underneath it.
+
+      This is only where the editor opens. Your RStudio settings and your
+      installed R packages always live in `~/rstudio/`, whatever you put here.
+
+  cpu:
+    widget: number_field
+    label: "CPUs"
+    min: 1
+    max: 8
+    value: 2
+    step: 1
+    required: true
+
+  memory:
+    widget: number_field
+    label: "Memory (GB)"
+    min: 1
+    max: 32
+    value: 8
+    step: 1
+    required: true
+
+# Deliberately no shell field, unlike the workshop app.
+#
+# RStudio's Terminal tab can only offer shells this image actually has, and the
+# image reports exactly one. Asked over the session RPC:
+#
+#   $ curl .../rpc/get_terminal_shells
+#   {"result":[{"type":"bash","name":"Bash"},{"type":"custom","name":"Custom"}]}
+#
+# There is no zsh and no tcsh here, so a shell menu would have one real entry.
+# The session uses "custom", pointed at a wrapper that runs bash as a login
+# shell -- see /usr/local/bin/cirrus-shell in the image for why the plain Bash
+# entry is not used.

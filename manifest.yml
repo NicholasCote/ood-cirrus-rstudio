@@ -1,0 +1,14 @@
+---
+name: RStudio Server (CIRRUS)
+category: Interactive Apps
+subcategory: Servers
+role: batch_connect
+description: |
+  This app launches an [RStudio Server] session on the CIRRUS Kubernetes cluster
+  with your GLADE home directory mounted.
+
+  R packages you install go to `~/rstudio/r-libs/`, which is deliberately
+  separate from the library your Casper and Derecho sessions use — packages
+  built in this container are not loadable by the R on those systems.
+
+  [RStudio Server]: https://posit.co/products/open-source/rstudio-server/

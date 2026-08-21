@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""Per-session password gate in front of RStudio Server.
+
+Why this exists
+---------------
+RStudio Server cannot authenticate anyone when it is not running as root, and
+this session is not: the pod runs as the user's real NFS uid so that files
+written to GLADE belong to them.
+
+Verified against the rserver in this image (2026.08.1+195), with a PAM helper
+configured and with every auth setting left at its default:
+
+    $ curl -c jar 'http://.../auth-sign-in?appUri=%2F'
+    HTTP/1.1 302 Moved Temporarily
+    Set-Cookie: user-id=ncote|...
+
+No password was sent, no login form was served, and the helper at
+--auth-pam-helper-path was never executed -- there is no line from it anywhere
+in the log. That is not a misconfiguration: running without privilege, rserver
+cannot switch to any user other than the one it already is, so there is nothing
+for it to authenticate and it signs the caller straight in. Requesting the
+sign-in page IS the sign-in.
+
+So the choice was between --auth-none=1 (which is what the above amounts to,
+just stated honestly) and putting the check somewhere that can enforce it. This
+is that somewhere: it holds the port, checks the session password once per
+connection, and relays bytes to an rserver bound to loopback.
+
+Design notes
+------------
+* Pure standard library. Adding a Python web framework to an R image to guard
+  one password would be a poor trade, and every dependency here is another thing
+  for Harbor's scanner to report.
+
+* The check is per *connection*, on the first request only, and afterwards the
+  connection is a blind byte relay. That is what keeps websockets working:
+  RStudio's console and terminal both upgrade, and an upgraded connection is no
+  longer HTTP to parse. A browser sends its cookies on the websocket handshake
+  like any other request, so the handshake is checked exactly like a GET.
+
+* It never rewrites a body, a header, or a path. OnDemand's /rnode/ proxy has
+  already stripped its prefix by the time a request arrives here, and rserver
+  puts the prefix back into its own redirects and cookies from --www-root-path.
+  The only place this process needs to know the prefix is the login form's
+  action and the cookie's Path, both of which the browser resolves against the
+  OnDemand host -- hence CIRRUS_RSTUDIO_ROOT_PATH.
+"""
+
+import base64
+import hmac
+import os
+import re
+import secrets
+import socket
+import sys
+import threading
+import urllib.parse
+
+PROG = "cirrus-rstudio-gate"
+
+LISTEN_PORT = int(os.environ.get("CIRRUS_RSTUDIO_PORT", "8080"))
+UPSTREAM_PORT = int(os.environ.get("CIRRUS_RSTUDIO_UPSTREAM_PORT", "8788"))
+UPSTREAM_HOST = "127.0.0.1"
+ROOT_PATH = os.environ.get("CIRRUS_RSTUDIO_ROOT_PATH", "/")
+PASSWORD_FILE = os.environ.get(
+    "CIRRUS_RSTUDIO_PASSWORD_FILE_RESOLVED", "/tmp/cirrus-rstudio/session-password"
+)
+
+COOKIE_NAME = "cirrus_rstudio_gate"
+SIGNIN_PATH = "cirrus-signin"
+
+# The head of an HTTP request is small; anything larger than this before the
+# blank line is not a request we should be forwarding.
+MAX_HEAD = 64 * 1024
+RELAY_CHUNK = 65536
+
+
+def log(msg):
+    print("%s: %s" % (PROG, msg), file=sys.stderr, flush=True)
+
+
+def read_password():
+    try:
+        with open(PASSWORD_FILE) as fh:
+            return fh.read().strip()
+    except OSError as exc:
+        log("cannot read %s: %s" % (PASSWORD_FILE, exc))
+        return ""
+
+
+# One token per process. It is what the cookie carries, so the password itself
+# is never stored in the browser and a token from a previous pod is worthless.
+SESSION_TOKEN = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+
+
+def http_response(status, body, extra_headers=()):
+    body_bytes = body.encode("utf-8")
+    head = [
+        "HTTP/1.1 %s" % status,
+        "Content-Type: text/html; charset=utf-8",
+        "Content-Length: %d" % len(body_bytes),
+        "Cache-Control: no-store",
+        "X-Content-Type-Options: nosniff",
+        "Connection: close",
+    ]
+    head.extend(extra_headers)
+    return ("\r\n".join(head) + "\r\n\r\n").encode("utf-8") + body_bytes
+
+
+LOGIN_PAGE = """<!doctype html>
+<title>RStudio &middot; CIRRUS</title>
+<style>
+ body {{ font-family: system-ui, sans-serif; margin: 4rem auto; max-width: 30rem;
+        color: #1a1a1a; background: #fff; }}
+ form {{ display: flex; gap: .5rem; margin: 1.5rem 0; }}
+ input[type=password] {{ flex: 1; padding: .5rem; font-size: 1rem; }}
+ button {{ padding: .5rem 1rem; font-size: 1rem; }}
+ p.err {{ color: #a00; }}
+ p.note {{ color: #555; font-size: .9rem; }}
+</style>
+<h1>RStudio Server</h1>
+{message}
+<form method="post" action="{action}">
+  <input type="password" name="password" autofocus placeholder="Session password">
+  <button type="submit">Sign in</button>
+</form>
+<p class="note">This session has its own password, generated when it launched.
+Going back to the OnDemand dashboard and using the <b>Connect to RStudio</b>
+button signs you in without typing it.</p>
+"""
+
+
+def login_page(action, error=None):
+    message = '<p class="err">%s</p>' % error if error else ""
+    return LOGIN_PAGE.format(message=message, action=action)
+
+
+def parse_head(head):
+    """Return (method, path, headers-dict-lowercased). Malformed -> None."""
+    try:
+        text = head.decode("latin-1")
+    except UnicodeDecodeError:
+        return None
+    lines = text.split("\r\n")
+    parts = lines[0].split(" ")
+    if len(parts) < 3:
+        return None
+    method, path = parts[0], parts[1]
+    headers = {}
+    for line in lines[1:]:
+        if not line:
+            continue
+        name, _, value = line.partition(":")
+        # Repeated headers are joined the way the RFC says to, which matters for
+        # Cookie: browsers may send it more than once.
+        name = name.strip().lower()
+        value = value.strip()
+        if name in headers:
+            headers[name] = headers[name] + "; " + value
+        else:
+            headers[name] = value
+    return method, path, headers
+
+
+def has_valid_cookie(headers):
+    raw = headers.get("cookie", "")
+    for item in raw.split(";"):
+        name, _, value = item.strip().partition("=")
+        if name == COOKIE_NAME:
+            # compare_digest, not ==: the token is a secret and a timing
+            # difference on a 43-character comparison is a real oracle.
+            if hmac.compare_digest(value, SESSION_TOKEN):
+                return True
+    return False
+
+
+def normalised_root():
+    """The prefix the browser sees, with exactly one trailing slash."""
+    root = ROOT_PATH if ROOT_PATH.startswith("/") else "/" + ROOT_PATH
+    return root if root.endswith("/") else root + "/"
+
+
+SIGNIN_URL = normalised_root() + SIGNIN_PATH
+
+
+def is_signin_request(path):
+    """Does this request target the sign-in endpoint?
+
+    Matched on the suffix, not the whole path, because the two OnDemand proxies
+    deliver it differently: /rnode/ strips its prefix, so the request arrives as
+    /cirrus-signin, while a direct connection or a non-stripping proxy would
+    deliver the whole /rnode/<node>/<port>/cirrus-signin.
+    """
+    return path.split("?", 1)[0].endswith("/" + SIGNIN_PATH)
+
+
+def read_head(sock):
+    """Read up to and including the blank line. Returns (head, leftover)."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        if len(buf) > MAX_HEAD:
+            return None, b""
+        try:
+            chunk = sock.recv(RELAY_CHUNK)
+        except OSError:
+            return None, b""
+        if not chunk:
+            return None, b""
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    return head, rest
+
+
+def read_body(sock, headers, already):
+    length = headers.get("content-length", "")
+    if not re.fullmatch(r"\d{1,9}", length):
+        return already
+    length = int(length)
+    body = already
+    while len(body) < length:
+        try:
+            chunk = sock.recv(min(RELAY_CHUNK, length - len(body)))
+        except OSError:
+            break
+        if not chunk:
+            break
+        body += chunk
+    return body
+
+
+def relay(src, dst):
+    try:
+        while True:
+            data = src.recv(RELAY_CHUNK)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        # Half-close rather than close: the other direction may still be
+        # delivering, which for a websocket is the normal state of affairs.
+        for sock in (src, dst):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def proxy(client, head, leftover):
+    upstream = socket.create_connection((UPSTREAM_HOST, UPSTREAM_PORT), timeout=30)
+    upstream.settimeout(None)
+    client.settimeout(None)
+    upstream.sendall(head + b"\r\n\r\n" + leftover)
+    threads = [
+        threading.Thread(target=relay, args=(client, upstream), daemon=True),
+        threading.Thread(target=relay, args=(upstream, client), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    for sock in (client, upstream):
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def handle(client, addr):
+    try:
+        client.settimeout(60)
+        head, leftover = read_head(client)
+        if head is None:
+            return
+        parsed = parse_head(head)
+        if parsed is None:
+            client.sendall(http_response("400 Bad Request", "<h1>Bad request</h1>"))
+            return
+        method, path, headers = parsed
+        # The form action and the cookie path have to be what the BROWSER sees,
+        # which is not what this process sees: OnDemand's /rnode/ proxy strips
+        # its prefix before forwarding, so the request path here has no prefix
+        # at all. The prefix is passed in instead, computed by an init container
+        # from the node name and the assigned NodePort -- neither of which
+        # exists until the pod is scheduled. Derived from the request path
+        # instead, the form would post to the OnDemand host's own root and the
+        # cookie would be scoped to it.
+        action = SIGNIN_URL
+
+        if has_valid_cookie(headers):
+            proxy(client, head, leftover)
+            return
+
+        if method == "POST" and is_signin_request(path):
+            body = read_body(client, headers, leftover)
+            fields = urllib.parse.parse_qs(body.decode("latin-1", "replace"))
+            supplied = (fields.get("password") or [""])[0]
+            expected = read_password()
+            if expected and hmac.compare_digest(supplied, expected):
+                # Path is the proxy prefix this request arrived under, so the
+                # browser sends the cookie back for every RStudio URL and for
+                # nothing else on the OnDemand host.
+                cookie_path = normalised_root()
+                redirect = (fields.get("to") or [cookie_path])[0]
+                log("sign-in accepted from %s" % (addr[0],))
+                client.sendall(
+                    http_response(
+                        "302 Found",
+                        "<a href=\"%s\">RStudio</a>" % redirect,
+                        (
+                            "Location: %s" % redirect,
+                            "Set-Cookie: %s=%s; Path=%s; HttpOnly; SameSite=Lax"
+                            % (COOKIE_NAME, SESSION_TOKEN, cookie_path),
+                        ),
+                    )
+                )
+            else:
+                log("sign-in refused from %s" % (addr[0],))
+                client.sendall(
+                    http_response(
+                        "401 Unauthorized",
+                        login_page(action, "That is not this session's password."),
+                    )
+                )
+            return
+
+        # Anything else without a cookie gets the login form, with the status
+        # matching what it is: a refusal for an API call, a page for a browser.
+        status = "200 OK" if method == "GET" else "401 Unauthorized"
+        client.sendall(http_response(status, login_page(action)))
+    except OSError:
+        pass
+    finally:
+        try:
+            client.close()
+        except OSError:
+            pass
+
+
+def main():
+    password = read_password()
+    if not password:
+        log("no session password is available; refusing to start.")
+        log("Every request would be rejected, which is worse than not starting:")
+        log("the pod would look healthy and no one could get in.")
+        return 1
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", LISTEN_PORT))
+    listener.listen(128)
+    log(
+        "listening on 0.0.0.0:%d, forwarding to %s:%d (sign-in at %s)"
+        % (LISTEN_PORT, UPSTREAM_HOST, UPSTREAM_PORT, SIGNIN_URL)
+    )
+
+    while True:
+        try:
+            client, addr = listener.accept()
+        except OSError as exc:
+            log("accept failed: %s" % exc)
+            continue
+        threading.Thread(target=handle, args=(client, addr), daemon=True).start()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

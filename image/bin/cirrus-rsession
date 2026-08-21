@@ -1,0 +1,48 @@
+#!/bin/bash
+#
+# Wrapper around rsession, named to rserver with --rsession-path.
+#
+# It exists because rserver does not hand its environment to the R session. It
+# builds a filtered one: RSTUDIO_CONFIG_HOME, RSTUDIO_DATA_HOME and
+# XDG_CONFIG/DATA/STATE_HOME survive, while LD_PRELOAD, NSS_WRAPPER_*,
+# XDG_CACHE_HOME, TMPDIR, R_LIBS and R_LIBS_USER are all dropped. Verified by
+# reading /proc/$(pgrep -x rsession)/environ on a running session.
+#
+# /etc/rstudio/env-vars does not solve it either -- rserver applies that to
+# itself ("Setting server environment variable ...") and the session still comes
+# up without them.
+#
+# The visible consequence is the Terminal tab. Without nss_wrapper the session's
+# uid has no name, so the prompt is a number, `whoami` fails or prints the uid,
+# and git refuses to commit at all:
+#
+#     fatal: unable to look up current user in the passwd file
+#
+# So the values are read back from the file the entrypoint wrote and put into
+# the environment here, one exec before the session starts -- which puts them in
+# front of rsession, the R process, and every terminal the user opens.
+
+set -u
+
+STATE_DIR="${CIRRUS_RSTUDIO_STATE_DIR:-/tmp/cirrus-rstudio}"
+ENV_FILE="${STATE_DIR}/session-env"
+
+# Absent when the image is run without the entrypoint. Not an error: rsession
+# then behaves exactly as the base image's would.
+if [ -r "$ENV_FILE" ]; then
+    # Read rather than sourced. This file is machine-written NAME=value lines
+    # and nothing else, and sourcing it would execute whatever ended up in it.
+    while IFS='=' read -r name value; do
+        case "$name" in
+            ''|'#'*) continue ;;
+            # An allowlist, not "export whatever is in the file". This process
+            # is on the path between rserver and the user's R session; the only
+            # things that belong in it are the ones rserver dropped.
+            LD_PRELOAD|NSS_WRAPPER_PASSWD|NSS_WRAPPER_GROUP|XDG_CACHE_HOME|TMPDIR|R_ENVIRON_USER|USER|LOGNAME)
+                export "${name}=${value}" ;;
+            *) ;;
+        esac
+    done < "$ENV_FILE"
+fi
+
+exec /usr/lib/rstudio-server/bin/rsession "$@"

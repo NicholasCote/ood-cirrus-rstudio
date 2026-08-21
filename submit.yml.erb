@@ -1,0 +1,244 @@
+<%-
+  # ---------------------------------------------------------------------------
+  # The image. Fixed here, not offered on the form: which container RStudio runs
+  # in is not a decision someone opening an editor should have to make, and a
+  # wrong answer produces a session that dies instantly.
+  #
+  # Pinned to an explicit tag. CI publishes date tags (%Y-%m-%d.%H.%M); bump this
+  # to the tag you have tested, never to something floating.
+  # ---------------------------------------------------------------------------
+  rstudio_img = "hub.k8s.ucar.edu/ncote/rstudio-server:2026-08-19.23.55"
+
+  # Ohio Supercomputer Center's helper image, the same one the other CIRRUS OOD
+  # apps use. Provides kubectl plus /bin/save_passwd_as_secret and
+  # /bin/add_line_to_configmap.
+  utility_img = "docker.io/ohiosupercomputer/ood-k8s-utils:latest"
+
+  user = OodSupport::User.new
+
+  # How long a session may sit idle before it ends itself, and how often that is
+  # checked. Enforced by the watchdog in the image's entrypoint, which watches
+  # rserver's data directory and RStudio's session state for activity and ends
+  # the pod when nothing has moved. Measured on this image: those mtimes do not
+  # advance at all while no client is connected, and advance on every use, so an
+  # hour is far clear of a false positive.
+  idle_timeout = 3600
+  idle_check_interval = 300
+
+  # Hard ceiling on a session, and the backstop for the one case idle culling
+  # structurally cannot catch: a tab left open in the foreground.
+  #
+  # Deliberately not a form field. As "Wall time (hours)" it would render a
+  # 00h00m00s lifetime whenever the value went missing, and a reaper honours that
+  # instantly -- killing every session the moment it starts.
+  max_session_hours = 12
+
+  # ---------------------------------------------------------------------------
+  # Form values.
+  #
+  # NEVER assign to a name that is also a form field. Form values arrive as
+  # methods, and `working_dir = working_dir.to_s` makes `working_dir` a local for
+  # the whole scope, so the right-hand side reads the unassigned local (nil)
+  # instead of the form value. Ruby decides that at parse time, so there is no
+  # error to notice -- in the sibling workshop app an `editor` field assigned to
+  # an `editor` local made every VS Code launch start JupyterLab. The house
+  # convention is a distinct name: image_ref from custom_image, workdir from
+  # working_dir.
+  # ---------------------------------------------------------------------------
+  workdir = working_dir.to_s.strip
+  workdir = user.home if workdir.empty?
+
+  # This app renders submit.yml.erb; ood_core then parses the result and renders
+  # its own pod.yml.erb from it, interpolating values into bare double quotes.
+  # We do not control that template, so a value containing ": ", a double quote,
+  # "#", or a newline could restructure the generated Pod manifest. Reject
+  # anything that is not the shape we expect rather than trying to out-escape a
+  # template in another gem.
+  unless workdir.match?(%r{\A/[A-Za-z0-9 ._\-/]{0,1023}\z})
+    raise "Invalid working directory: #{workdir.inspect}. " \
+          "Expected an absolute path built from letters, digits, spaces, " \
+          "'.', '_', '-', and '/'."
+  end
+
+  # ---------------------------------------------------------------------------
+  # The proxy. /rnode/, and this is not interchangeable with /node/.
+  #
+  # OnDemand ships two:
+  #   /node/HOST/PORT/...   forwards the whole path, prefix included.
+  #   /rnode/HOST/PORT/...  strips the prefix and forwards the remainder.
+  #
+  # RStudio needs the stripping one. --www-root-path looks like it makes /node/
+  # work and does not: it tells rserver what prefix to EMIT in its own redirects
+  # and cookies, not what prefix to expect on the way in. Verified against the
+  # rserver in this image -- with --www-root-path=/node/fakenode/30123/ set:
+  #
+  #   GET /node/fakenode/30123/   ->  404 Not Found
+  #   GET /                       ->  302, Location: .../node/fakenode/30123/auth-sign-in
+  #                                   Set-Cookie: user-id=...; path=/node/fakenode/30123
+  #
+  # So rserver serves at the root and puts the prefix back into everything it
+  # generates, which is exactly the /rnode/ contract.
+  #
+  # The prefix is still needed -- without it every RStudio redirect and cookie
+  # would drop it and the browser would leave the session -- and it contains the
+  # node name and the assigned NodePort, neither of which exists until the pod is
+  # scheduled and the service created. Hence the init container below.
+  # ---------------------------------------------------------------------------
+  base_url_file = "base_url"
+
+  # The password file the container waits on. One ConfigMap, one mount path:
+  # ood_core emits a volumeMount per file that declares one, and each mounts the
+  # whole ConfigMap volume, so two files naming the same mount_path produce
+  # duplicate mountPaths and the API server rejects the pod:
+  #   spec.containers[0].volumeMounts[1].mountPath: "/ood": must be unique
+  # Files with no mount_path are still projected into /ood alongside it.
+  passwd_file = "csenv"
+-%>
+---
+batch_connect:
+  template: "basic"
+script:
+  wall_time: "<%= max_session_hours * 3600 %>"
+  native:
+    container:
+      name: "rstudio-server"
+      image: "<%= rstudio_img %>"
+      # The image's own entrypoint. Every token is space-free on purpose:
+      # ood_core renders this into the pod's `command` array by splitting on
+      # whitespace, so a quoted argument would not survive.
+      command: "/usr/local/bin/entrypoint.sh rserver"
+      restart_policy: "OnFailure"
+      # Start in the user's GLADE home. The image's own WORKDIR is irrelevant
+      # here and the session runs as the user's real uid, so nothing will cd for
+      # us.
+      working_dir: "<%= user.home %>"
+      env:
+        HOME: "<%= user.home %>"
+        # USER, NB_USER and GROUP are the authority for the session's identity.
+        # The pod runs as the user's real NFS uid, which has no /etc/passwd entry
+        # in the image -- and a container runtime may synthesise one whose name
+        # is the uid itself. The entrypoint uses these three to give the uid a
+        # real name through nss_wrapper, which rserver needs (it resolves
+        # --server-user with getpwnam and refuses to start otherwise) and which
+        # the Terminal tab, git and ssh all need.
+        USER: "<%= user.name %>"
+        NB_USER: "<%= user.name %>"
+        GROUP: "<%= user.group.name %>"
+
+        # Where the Files pane opens and the console starts. Deliberately NOT
+        # where anything persists: the image keeps settings and installed
+        # packages under $HOME/rstudio regardless of this value, because
+        # deriving a persistence path from a working directory turns "I set my
+        # working directory to my home" into writes to shared dotfiles.
+        CIRRUS_RSTUDIO_WORKDIR: "<%= workdir %>"
+
+        CIRRUS_RSTUDIO_PORT: "8080"
+
+        # Per-session password, enforced by the gate in front of rserver.
+        #
+        # It has to be enforced there rather than by RStudio: running without
+        # privilege -- which this session always is, since the pod runs as the
+        # user's uid -- rserver signs the caller in as the server user on
+        # request. Verified with a PAM helper configured and every auth option at
+        # its default:
+        #   $ curl -c jar '.../auth-sign-in?appUri=%2F'
+        #   HTTP/1.1 302 Moved Temporarily
+        #   Set-Cookie: user-id=ncote|...
+        # with no password sent and no line from the helper anywhere in the log.
+        CIRRUS_RSTUDIO_AUTH: "password"
+        CIRRUS_RSTUDIO_PASSWORD_FILE: "/ood/<%= passwd_file %>"
+
+        # Written by the add-baseurl-to-cfg init container below.
+        CIRRUS_RSTUDIO_BASE_URL_FILE: "/ood/<%= base_url_file %>"
+
+        CIRRUS_RSTUDIO_IDLE_TIMEOUT: "<%= idle_timeout %>"
+        CIRRUS_RSTUDIO_IDLE_CHECK: "<%= idle_check_interval %>"
+      port: 8080
+      cpu: "<%= cpu.to_i %>"
+      memory: "<%= memory.to_i %>Gi"
+      # ood_core's default startup probe allows 2s + 5 x 5s = 27s for the port to
+      # open, and that is not enough here. The entrypoint waits for the init
+      # container's password to land in the ConfigMap before it binds anything --
+      # volumes are projected before init containers run, so the file is present
+      # and empty until kubelet re-projects it -- and it creates directories in a
+      # GLADE home over NFS on the way. Measured locally the port answers in well
+      # under a second; the wait is what needs the budget. Allow five minutes.
+      startup_probe:
+        initial_delay_seconds: 5
+        failure_threshold: 60
+        period_seconds: 5
+    mounts:
+      - type: nfs
+        name: home
+        host: "gladenfs.hpc.ucar.edu"
+        path: "/gpfs/u/home/<%= user.name %>"
+        destination_path: "<%= user.home %>"
+    configmap:
+      files:
+        # Seeded with a comment so the key exists for add_line_to_configmap to
+        # read back and append to. The entrypoint greps for '^password=', so this
+        # line never matches.
+        - filename: "<%= passwd_file %>"
+          mount_path: "/ood"
+          data: |
+            # session password is appended here by the add-passwd-to-cfg init container
+        # Starts empty; add-baseurl-to-cfg replaces it with the computed prefix.
+        # No mount_path of its own -- see the note above about duplicate mounts.
+        - filename: "<%= base_url_file %>"
+          data: |
+    init_containers:
+      # Generate a random password into <pod>-secret. OnDemand's kubernetes
+      # adapter reads that Secret back and exposes every key in it to
+      # view.html.erb, which is where the `password` local there comes from. So
+      # both ends agree on the password without it ever being rendered into an
+      # app template or written to the user's home.
+      - name: "init-secret"
+        image: "<%= utility_img %>"
+        command:
+          - "/bin/save_passwd_as_secret"
+
+      # Copy it into the ConfigMap so the container itself can read it. The
+      # Secret is not mounted into the pod, and the session container has no
+      # kubectl and no RBAC to fetch it.
+      #
+      # No double quotes anywhere in these command arrays, and that is
+      # load-bearing rather than a style choice: ood_core re-emits every element
+      # into its own pod.yml.erb as `- "<the element>"`, so a double quote closes
+      # that YAML string early and the whole manifest fails to parse with
+      # "error converting YAML to JSON: did not find expected key". Surviving two
+      # YAML passes takes four backslashes; not needing to is better.
+      #
+      # Nothing needs quoting here anyway: create_passwd builds the password from
+      # [a-zA-Z0-9] only, so $PASSWORD expands to exactly one word.
+      - name: "add-passwd-to-cfg"
+        image: "<%= utility_img %>"
+        command:
+          - "/bin/bash"
+          - "-c"
+          - "source /bin/passwd_from_secret; /bin/add_line_to_configmap password=$PASSWORD <%= passwd_file %>"
+
+      # Compute /rnode/<nodeName>/<nodePort>/ and write it where the container
+      # will read it. This cannot come from the pod spec: the NodePort is
+      # assigned when the service is created and the node name when the pod is
+      # scheduled.
+      #
+      # `kubectl create ... --dry-run=client -o yaml | kubectl apply -f -` rather
+      # than `kubectl patch`, for the quoting reason above -- a merge patch needs
+      # JSON, JSON needs double quotes, and a literal quote cannot appear here.
+      # --from-literal needs no quoting at all, and apply merges into the existing
+      # object so the password key survives.
+      #
+      # `get`, never `list`: the pod's service account is `default`, which can get
+      # pods and services in its namespace and cannot list them.
+      #
+      # No `|| true`, unlike the Secret work above. An RStudio that does not know
+      # its prefix emits redirects and cookies without it, and the browser ends up
+      # on the OnDemand dashboard's 404 rather than in the IDE -- with nothing
+      # anywhere the user can read. Failing the init container instead leaves the
+      # reason in `kubectl logs <pod> -c add-baseurl-to-cfg`.
+      - name: "add-baseurl-to-cfg"
+        image: "<%= utility_img %>"
+        command:
+          - "/bin/bash"
+          - "-c"
+          - "PORT_CFG=$(kubectl get services $(hostname)-service -o jsonpath='{.spec.ports[0].nodePort}'); HOST_CFG=$(kubectl get pods $(hostname) -o jsonpath='{.spec.nodeName}'); kubectl create configmap $(hostname)-configmap --from-literal=<%= base_url_file %>=/rnode/${HOST_CFG}/${PORT_CFG}/ --dry-run=client -o yaml | kubectl apply -f -"

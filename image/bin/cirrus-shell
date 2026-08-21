@@ -1,0 +1,24 @@
+#!/bin/bash
+#
+# The Terminal tab's shell.
+#
+# RStudio runs its POSIX terminal shell with --posix appended, and it does so
+# even for a shell configured as "custom" -- verified from the process table
+# with custom_shell_command=/bin/bash and custom_shell_options=-l:
+#
+#     /bin/bash --posix -l
+#
+# In POSIX mode bash expands \u from the uid rather than from the passwd entry:
+#
+#     $ bash         -c 'PS1="\u"; printf %s "${PS1@P}"'   ->  ncote
+#     $ bash --posix -c 'PS1="\u"; printf %s "${PS1@P}"'   ->  54321
+#
+# with nss_wrapper active and whoami answering ncote in both. So every terminal
+# would open with a prompt showing a bare uid, which reads as a broken session
+# to anyone who has used one, while everything in it actually works.
+#
+# Arguments are ignored on purpose: the only ones RStudio passes are the --posix
+# this exists to drop and the -l we are supplying ourselves. A login shell is
+# what we want -- it reads /etc/profile.d, which is where the session's PATH and
+# prompt come from.
+exec /bin/bash -l

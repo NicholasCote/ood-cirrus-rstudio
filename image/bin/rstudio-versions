@@ -1,0 +1,52 @@
+#!/bin/bash
+#
+# Print the versions this image was built with, or check the running system
+# against them.
+#
+#   rstudio-versions          print the recorded versions
+#   rstudio-versions --check  re-run each component and diff against the record
+#
+# The record is written once at build time (see the Dockerfile) so that a bug
+# report can name what it was running without anyone having to guess from a tag.
+
+set -uo pipefail
+
+RECORD=/opt/cirrus-rstudio/versions.txt
+
+if [ ! -r "$RECORD" ]; then
+    printf 'rstudio-versions: %s is missing; this is not a CIRRUS RStudio image.\n' "$RECORD" >&2
+    exit 1
+fi
+
+if [ "${1:-}" != "--check" ]; then
+    cat "$RECORD"
+    exit 0
+fi
+
+# Each of these prints the version the running system actually reports. Anything
+# not checkable at runtime (the base image reference, the Ubuntu release the
+# packages came from) is reported as recorded and marked so.
+actual_version() {
+    case "$1" in
+        R)              R --version 2>/dev/null | head -1 | awk '{print $3}' ;;
+        rstudio-server) printf '%s' "${RSTUDIO_VERSION:-}" ;;
+        ubuntu)         (. /etc/os-release; printf '%s' "$VERSION_ID") ;;
+        *)              printf '' ;;
+    esac
+}
+
+rc=0
+while IFS=$'\t' read -r name expected; do
+    case "$name" in ''|'#'*) continue ;; esac
+    got="$(actual_version "$name")"
+    if [ -z "$got" ]; then
+        printf '%-16s %-28s (recorded only, not checkable at runtime)\n' "$name" "$expected"
+    elif [ "$got" = "$expected" ]; then
+        printf '%-16s %-28s ok\n' "$name" "$expected"
+    else
+        printf '%-16s %-28s MISMATCH: running %s\n' "$name" "$expected" "$got"
+        rc=1
+    fi
+done < "$RECORD"
+
+exit "$rc"
