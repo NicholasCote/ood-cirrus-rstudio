@@ -548,18 +548,47 @@ PASSWORD_OK=1
 resolve_password || PASSWORD_OK=0
 
 # ===========================================================================
-# 6. Proxy root path
+# 6. Proxy prefix
 #
 # OnDemand ships two proxies and they are not interchangeable:
 #
 #   /node/HOST/PORT/...   forwards the whole path, prefix included.
-#   /rnode/HOST/PORT/...  strips the prefix.
+#   /rnode/HOST/PORT/...  strips the prefix, and rewrites what comes back.
 #
-# rserver has --www-root-path, so /node/ is the right one -- and the prefix is
-# /node/<nodeName>/<nodePort>/, neither of which exists until the pod is
-# scheduled and its service is assigned a NodePort. So it cannot come from the
-# pod spec: an init container computes it and writes it into a configmap file,
-# and this reads it.
+# This app is served through /rnode/, and its second half is the part that is
+# easy to miss. From OnDemand's own ood-portal.conf:
+#
+#   Header edit Location "^([^/]+//[^/]+)|(?=/)|^([\./]{1,}(?<!/))" \
+#                        "/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
+#   Header edit* Set-Cookie ";\s*(?i)Path[^;]*" ""
+#   Header edit  Set-Cookie "^([^;]+)" "$1; Path=/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
+#
+# The proxy strips its prefix on the way in and puts it back into every Location
+# header and every cookie Path on the way out. So the application it fronts has
+# to serve at the root and emit unprefixed redirects; anything that already
+# carries the prefix gets it a second time.
+#
+# Which is why rserver is NOT given --www-root-path here. Measured on this image
+# with --www-root-path=/rnode/fakenode/30123/ set, GET / answers:
+#
+#   Location: http://<host>/rnode/fakenode/30123/auth-sign-in?appUri=%2F
+#   Set-Cookie: user-id=...; path=/rnode/fakenode/30123
+#
+# and the first alternative of that regex replaces "http://<host>" with the
+# prefix, so the browser is sent to /rnode/.../30123/rnode/.../30123/auth-sign-in
+# -- the dashboard's 404. Without the flag rserver emits
+# "http://<host>/auth-sign-in?appUri=%2F", which the same rule turns into
+# /rnode/fakenode/30123/auth-sign-in. Nothing else needs the prefix: the IDE page
+# references its assets by relative path only (css/icons.css, js/diff.min.js,
+# rstudio/rstudio.nocache.js), and the proxy rewrites the cookie Path regardless
+# of what rserver set it to.
+#
+# The prefix is still read, for exactly one consumer: the gate's login form
+# action. That lives in a response BODY, which the proxy does not rewrite, and
+# the browser resolves it against the OnDemand host. It contains the node name
+# and the assigned NodePort, neither of which exists until the pod is scheduled
+# and its service assigned one, so it cannot come from the pod spec -- an init
+# container computes it into a ConfigMap file and this reads it.
 # ===========================================================================
 
 BASE_URL="${CIRRUS_RSTUDIO_BASE_URL:-}"
@@ -586,19 +615,20 @@ if [ -z "$BASE_URL" ] && [ -n "${CIRRUS_RSTUDIO_BASE_URL_FILE:-}" ]; then
         sleep 1
     done
     if [ -n "$BASE_URL" ]; then
-        log "root path read from ${CIRRUS_RSTUDIO_BASE_URL_FILE}: ${BASE_URL}"
+        log "proxy prefix read from ${CIRRUS_RSTUDIO_BASE_URL_FILE}: ${BASE_URL}"
     else
-        warn "no root path appeared at ${CIRRUS_RSTUDIO_BASE_URL_FILE}."
+        warn "no proxy prefix appeared at ${CIRRUS_RSTUDIO_BASE_URL_FILE}."
         warn "The init container that computes it did not write one. Check:"
         warn "    kubectl logs \$POD -c add-baseurl-to-cfg"
-        warn "Serving at / instead. Behind the OnDemand proxy that means RStudio's"
-        warn "own redirects and cookies drop the /rnode/<node>/<port>/ prefix, so"
-        warn "the session lands on the dashboard's 404 page instead of the IDE."
+        warn "The gate's login form will post to / instead. Behind the OnDemand"
+        warn "proxy that is the dashboard's own root, so typing the password by"
+        warn "hand lands on a 404. The Connect button still works: it posts to"
+        warn "the full /rnode/<node>/<port>/cirrus-signin from the dashboard."
     fi
 fi
 [ -n "$BASE_URL" ] || BASE_URL="/"
-# rserver wants a trailing slash on a non-root path; without it the assets it
-# emits are one path segment short.
+# One trailing slash, so the gate's form action is /rnode/<node>/<port>/ + the
+# sign-in path rather than a run-together /<port>cirrus-signin.
 case "$BASE_URL" in */) ;; *) BASE_URL="${BASE_URL}/" ;; esac
 
 PORT="${CIRRUS_RSTUDIO_PORT:-8080}"
@@ -623,7 +653,7 @@ if [ "$MODE" = "bootstrap" ]; then
     log "  session env      : ${SESSION_ENV_FILE}"
     log "  R site profile   : ${RPROFILE_SESSION}"
     log "  rsession.conf    : ${SESSION_CONF}"
-    log "  root path        : ${BASE_URL}"
+    log "  proxy prefix     : ${BASE_URL} (gate login form only)"
     log "  port             : ${PORT}"
     exit 0
 fi
@@ -718,7 +748,8 @@ args=(
     # does not use but anything else in the cluster could.
     --www-address="${RSERVER_ADDRESS}"
     --www-port="${RSERVER_PORT}"
-    --www-root-path="${BASE_URL}"
+    # No --www-root-path. rserver must serve at the root behind /rnode/ -- see
+    # section 6. Setting it here doubles the prefix in every redirect.
     # Both of these default to paths under /var, owned by rstudio-server and not
     # writable by the session's uid.
     --server-data-dir="${STATE_DIR}/server-data"
@@ -731,7 +762,7 @@ args=(
 )
 [ "$USE_GATE" -eq 1 ] || args+=(--auth-none=1)
 
-log "starting rserver: ${RSERVER_ADDRESS}:${RSERVER_PORT} root-path=${BASE_URL} user=${SERVER_USER} (uid ${UID_NOW}) workdir=${WORKDIR}"
+log "starting rserver: ${RSERVER_ADDRESS}:${RSERVER_PORT} root-path=/ user=${SERVER_USER} (uid ${UID_NOW}) workdir=${WORKDIR}"
 
 # Not exec'd. This shell stays as PID 1 so it can supervise both processes, cull
 # an idle session, and decide what exit status to report -- see below.

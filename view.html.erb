@@ -12,15 +12,17 @@
   info.md.erb is the template with user_context.
 
   /rnode/, not /node/, and the two are not interchangeable. OnDemand's /node/
-  proxy forwards the whole path; /rnode/ strips its prefix. RStudio needs the
-  stripping one: --www-root-path tells rserver what prefix to EMIT in its
-  redirects and cookies, not what to expect on the way in. Verified against the
-  rserver in this image, with the root path set:
+  proxy forwards the whole path; /rnode/ strips its prefix on the way in and
+  prepends it again to every Location header and cookie Path on the way out.
+  RStudio needs the stripping one -- --www-root-path tells rserver what prefix to
+  EMIT, not what to expect on the way in, so pointed at /node/ every request
+  lands on RStudio's own 404 page.
 
-    GET /node/<node>/<port>/  ->  404 Not Found
-    GET /                     ->  302, Location: .../node/<node>/<port>/auth-sign-in
-
-  Pointed at /node/ instead, every request lands on RStudio's 404 page.
+  Because /rnode/ does the putting-back itself, nothing inside the session is
+  told the prefix: rserver runs with no --www-root-path and the gate redirects to
+  "/". The one exception is right here. This is a response body, and the proxy
+  rewrites headers only, so the form action has to be the full path the browser
+  will resolve against the OnDemand host.
 
   The POST goes to the gate rather than to RStudio's own /auth-do-sign-in,
   because RStudio has no sign-in to do: running without privilege it signs the

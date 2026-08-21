@@ -106,17 +106,42 @@ GET /                       ->  302, Location: .../node/fakenode/30123/auth-sign
                                 Set-Cookie: user-id=...; path=/node/fakenode/30123
 ```
 
-So rserver serves at the root and puts the prefix back into everything it
-generates — which is exactly the `/rnode/` contract, since `/rnode/` strips its
-prefix before forwarding. `view.html.erb` posts to `/rnode/HOST/PORT/`.
+So `/rnode/` it is — and `/rnode/` does not want that prefix emitted either,
+because it puts the prefix back itself. From OnDemand's `ood-portal.conf`:
 
-The prefix is still needed, or every RStudio redirect and cookie would drop it
-and the browser would leave the session. It is `/rnode/<nodeName>/<nodePort>/`,
-and neither part exists until the pod is scheduled and its service assigned a
-NodePort — so it cannot come from the pod spec. The `add-baseurl-to-cfg` init
-container computes it and writes it into the ConfigMap; the entrypoint reads it
-and passes it to `--www-root-path`, and the gate uses it for the login form's
-action and the cookie's `Path`.
+```apache
+Header edit Location "^([^/]+//[^/]+)|(?=/)|^([\./]{1,}(?<!/))" \
+                     "/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
+Header edit* Set-Cookie ";\s*(?i)Path[^;]*" ""
+Header edit  Set-Cookie "^([^;]+)" "$1; Path=/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
+```
+
+It strips the prefix on the way in, and on the way out prepends it to every
+`Location` and rewrites every cookie `Path`. Anything that already carries the
+prefix therefore gets it twice — which is exactly what the first live session
+did, landing the browser on
+
+```
+.../rnode/mlc1w9.k8s.ucar.edu/32072/rnode/mlc1w9.k8s.ucar.edu/32072/
+```
+
+and the dashboard's "requested page not found". Two things produce that: rserver
+told the prefix by `--www-root-path` (its `Location` is a full URL built from the
+`Host` header, and the rule's first alternative swaps scheme-and-authority for
+the prefix), and the gate redirecting to the prefixed root after a correct
+password. So neither does it any more: **rserver runs with no
+`--www-root-path`** and **the gate redirects to `/`**. Serving at the root is
+safe because the IDE page references every asset by relative path —
+`css/icons.css`, `js/diff.min.js`, `rstudio/rstudio.nocache.js`, no
+root-absolute reference at all, which `image/test/acceptance.sh` now asserts.
+
+The prefix is still needed for one thing the proxy cannot help with: response
+**bodies** are not rewritten, so the gate's login form action has to be the full
+path the browser resolves against the OnDemand host, and so does the Connect
+button in `view.html.erb`. It is `/rnode/<nodeName>/<nodePort>/`, and neither
+part exists until the pod is scheduled and its service assigned a NodePort — so
+it cannot come from the pod spec. The `add-baseurl-to-cfg` init container
+computes it into the ConfigMap and the entrypoint reads it, for the gate alone.
 
 ## Keeping out of the shared home
 
@@ -248,7 +273,7 @@ podman build -t localhost/cirrus-rstudio:dev -f image/Dockerfile image
 image/test/acceptance.sh
 ```
 
-Last run, 22 checks, all passing:
+Last run, 24 checks, all passing:
 
 ```
 == 1. arbitrary uid, runtime-synthesised numeric passwd entry ==
@@ -262,8 +287,10 @@ Last run, 22 checks, all passing:
   ok   no cookie: login page, form posting to /rnode/fakenode/30123/cirrus-signin
   ok   wrong password refused (401)
   ok   correct password accepted, cookie issued
-  ok   rserver answers behind the gate and emits the /rnode/fakenode/30123 prefix in its redirects
+  ok   sign-in redirects to '/', unprefixed, so the proxy's rewrite lands on /rnode/fakenode/30123/
+  ok   rserver redirects to an unprefixed /auth-sign-in ('http://127.0.0.1:18080/auth-sign-in?appUri=%2F')
   ok   the IDE page loads through the gate (200)
+  ok   the IDE page references no root-absolute asset (safe to serve at /)
   ok   client_init succeeded; an R session is running
   ok   client_init reports r_libs_user=/home/ncote/rstudio/r-libs/4.6
 == 4. websocket upgrade through the gate, foreign Origin ==

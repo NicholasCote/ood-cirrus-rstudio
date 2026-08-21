@@ -112,28 +112,46 @@ cookie=$(curl -s -D - -o /dev/null -A "$UA" -X POST -d "password=${PASSWORD}" \
         "http://127.0.0.1:${PORT}/cirrus-signin" | grep -i '^set-cookie:' | sed 's/.*: //; s/;.*//')
 [ -n "$cookie" ] && ok "correct password accepted, cookie issued" || bad "correct password issued no cookie"
 
+# The 302 the gate sends after a correct password. It must NOT carry the prefix:
+# OnDemand's /rnode/ block prepends the prefix to every Location it forwards, so
+# a prefixed one arrives at the browser doubled --
+# /rnode/<node>/<port>/rnode/<node>/<port>/ -- which is a 404 on the dashboard,
+# and was what the first live session did.
+loc=$(curl -s -D - -o /dev/null -A "$UA" -X POST -d "password=${PASSWORD}" \
+        "http://127.0.0.1:${PORT}/cirrus-signin" | grep -i '^location:' | tr -d '\r' | sed 's/.*: //')
+[ "$loc" = "/" ] \
+    && ok "sign-in redirects to '/', unprefixed, so the proxy's rewrite lands on ${PREFIX}/" \
+    || bad "sign-in redirect is '${loc}', expected '/' (a prefix here gets applied twice)"
+
 # Past the gate, requests reach rserver. Note the paths below carry NO prefix:
-# that is what OnDemand's /rnode/ proxy delivers, having stripped it. rserver
-# serves at the root and puts the prefix back into its own redirects, which is
-# exactly what this asserts.
+# that is what OnDemand's /rnode/ proxy delivers, having stripped it -- and for
+# the same reason rserver runs with no --www-root-path, so what it emits must be
+# unprefixed too. Its Location is a full URL built from the Host header; the
+# proxy's rule replaces the scheme and authority with the prefix.
 loc=$(curl -s -D - -o /dev/null -A "$UA" -H "Cookie: ${cookie}" "http://127.0.0.1:${PORT}/" \
       | grep -i '^location:' | tr -d '\r' | sed 's/.*: //')
 case "$loc" in
-    *"${PREFIX}/auth-sign-in"*)
-        ok "rserver answers behind the gate and emits the ${PREFIX} prefix in its redirects" ;;
-    *)  bad "expected a redirect carrying ${PREFIX}, got '${loc}'" ;;
+    *"${PREFIX}"*)
+        bad "rserver emitted the ${PREFIX} prefix ('${loc}'); the proxy would double it" ;;
+    */auth-sign-in*)
+        ok "rserver redirects to an unprefixed /auth-sign-in ('${loc}')" ;;
+    *)  bad "expected an unprefixed /auth-sign-in redirect, got '${loc}'" ;;
 esac
+
+# The IDE page references every asset by relative path -- css/icons.css,
+# js/diff.min.js, rstudio/rstudio.nocache.js -- which is what makes serving at
+# the root safe behind a prefix-stripping proxy that rewrites headers only. A
+# root-absolute reference here would be requested from the OnDemand host itself.
 
 # Sign in to RStudio itself and load the IDE. rserver signs the caller in on
 # request -- that is why the gate exists -- so this needs no password.
 rsjar="$WORK/rsjar.txt"
 curl -s -o /dev/null -A "$UA" -H "Cookie: ${cookie}" -c "$rsjar" \
      "http://127.0.0.1:${PORT}/auth-sign-in?appUri=%2F"
-# Cookies are sent as an explicit header rather than with -b. rserver scopes its
-# own cookies to the /rnode/<node>/<port> prefix -- correctly, that is what the
-# browser sees -- but this test talks to the gate directly on paths with no
-# prefix, standing in for what OnDemand's proxy forwards, so curl would consider
-# them out of scope and send nothing.
+# Cookies are sent as an explicit header rather than with -b, because the jar
+# curl writes here is not the jar a browser would hold behind the proxy: the
+# proxy rewrites every Set-Cookie Path to /rnode/<node>/<port>, and this test
+# sees the unrewritten ones.
 allcookies=$(sed 's/^#HttpOnly_//' "$rsjar" | grep -v '^#' | awk 'NF>=7{printf "%s=%s; ", $6, $7}')
 allcookies="${cookie}; ${allcookies}"
 code=$(curl -s -o "$WORK/ide.html" -w '%{http_code}' -A "$UA" -H "Cookie: ${allcookies}" \
@@ -141,6 +159,11 @@ code=$(curl -s -o "$WORK/ide.html" -w '%{http_code}' -A "$UA" -H "Cookie: ${allc
 grep -qi "rstudio" "$WORK/ide.html" && [ "$code" = "200" ] \
     && ok "the IDE page loads through the gate (${code})" \
     || bad "IDE page: got ${code} and no RStudio markup"
+
+abs=$(grep -oE '(src|href)="/[^"]*"' "$WORK/ide.html" | sort -u | tr '\n' ' ')
+[ -z "$abs" ] \
+    && ok "the IDE page references no root-absolute asset (safe to serve at /)" \
+    || bad "the IDE page has root-absolute references the proxy will not rewrite: ${abs}"
 
 # client_init is what makes rserver start an R session, so it has to happen
 # before anything below can look at one.

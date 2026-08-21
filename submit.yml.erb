@@ -76,11 +76,16 @@
   #   GET /                       ->  302, Location: .../node/fakenode/30123/auth-sign-in
   #                                   Set-Cookie: user-id=...; path=/node/fakenode/30123
   #
-  # So rserver serves at the root and puts the prefix back into everything it
-  # generates, which is exactly the /rnode/ contract.
+  # And /rnode/ does not want that prefix emitted either, because it puts the
+  # prefix back itself -- its ood-portal.conf block rewrites every Location and
+  # every cookie Path on the way out. An app that already emitted the prefix gets
+  # it twice, which is what the first live session did:
   #
-  # The prefix is still needed -- without it every RStudio redirect and cookie
-  # would drop it and the browser would leave the session -- and it contains the
+  #   .../rnode/mlc1w9.k8s.ucar.edu/32072/rnode/mlc1w9.k8s.ucar.edu/32072/
+  #
+  # So rserver runs with no --www-root-path and the gate redirects to "/". The
+  # prefix is still read by the session, for one consumer the proxy cannot help:
+  # the gate's login form action, which is in a response body. It contains the
   # node name and the assigned NodePort, neither of which exists until the pod is
   # scheduled and the service created. Hence the init container below.
   # ---------------------------------------------------------------------------

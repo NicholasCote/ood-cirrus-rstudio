@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-session password gate in front of RStudio Server.
+r"""Per-session password gate in front of RStudio Server.
 
 Why this exists
 ---------------
@@ -38,12 +38,25 @@ Design notes
   longer HTTP to parse. A browser sends its cookies on the websocket handshake
   like any other request, so the handshake is checked exactly like a GET.
 
-* It never rewrites a body, a header, or a path. OnDemand's /rnode/ proxy has
-  already stripped its prefix by the time a request arrives here, and rserver
-  puts the prefix back into its own redirects and cookies from --www-root-path.
-  The only place this process needs to know the prefix is the login form's
-  action and the cookie's Path, both of which the browser resolves against the
-  OnDemand host -- hence CIRRUS_RSTUDIO_ROOT_PATH.
+* It never rewrites a body, a header, or a path, and it deliberately does not
+  put the proxy prefix into anything the proxy will handle itself. OnDemand's
+  /rnode/ block does both halves:
+
+      Header edit Location "^([^/]+//[^/]+)|(?=/)|^([\./]{1,}(?<!/))" \
+                           "/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
+      Header edit* Set-Cookie ";\s*(?i)Path[^;]*" ""
+      Header edit  Set-Cookie "^([^;]+)" "$1; Path=/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
+
+  -- it strips the prefix on the way in, and prepends it to every Location and
+  rewrites every cookie Path on the way out. So the 302 this process sends after
+  a successful sign-in has to be plain "/". Sent as /rnode/<node>/<port>/ it
+  arrives at the browser as /rnode/<node>/<port>/rnode/<node>/<port>/, which is
+  a 404 on the dashboard -- the first thing this app did in OnDemand.
+
+  What the proxy does NOT rewrite is response bodies. The login form's action is
+  in a body, and the browser resolves it against the OnDemand host, so that one
+  string does need the full prefix -- and that is the only reason
+  CIRRUS_RSTUDIO_ROOT_PATH exists.
 """
 
 import base64
@@ -175,9 +188,36 @@ def has_valid_cookie(headers):
 
 
 def normalised_root():
-    """The prefix the browser sees, with exactly one trailing slash."""
+    """The prefix the browser sees, with exactly one trailing slash.
+
+    For the login form's action only. Never for a Location or a cookie Path --
+    see the note in the module docstring about the proxy rewriting both.
+    """
     root = ROOT_PATH if ROOT_PATH.startswith("/") else "/" + ROOT_PATH
     return root if root.endswith("/") else root + "/"
+
+
+def signin_target(raw):
+    """Where to send the browser after a correct password, as the APP sees it.
+
+    Root-relative and unprefixed, always: the proxy prepends its prefix to
+    whatever Location it forwards. Talking to this gate directly -- the
+    acceptance test, a port-forward -- "/" is also exactly right.
+
+    A caller-supplied `to` is honoured only if it is a single-slash-rooted path.
+    "//host/..." and "/\\host/..." are how a browser is sent to another origin,
+    and CR or LF would be a header injection, so all three are refused rather
+    than sanitised.
+    """
+    if (
+        raw.startswith("/")
+        and not raw.startswith("//")
+        and not raw.startswith("/\\")
+        and "\r" not in raw
+        and "\n" not in raw
+    ):
+        return raw
+    return "/"
 
 
 SIGNIN_URL = normalised_root() + SIGNIN_PATH
@@ -278,14 +318,14 @@ def handle(client, addr):
             client.sendall(http_response("400 Bad Request", "<h1>Bad request</h1>"))
             return
         method, path, headers = parsed
-        # The form action and the cookie path have to be what the BROWSER sees,
-        # which is not what this process sees: OnDemand's /rnode/ proxy strips
-        # its prefix before forwarding, so the request path here has no prefix
-        # at all. The prefix is passed in instead, computed by an init container
-        # from the node name and the assigned NodePort -- neither of which
-        # exists until the pod is scheduled. Derived from the request path
-        # instead, the form would post to the OnDemand host's own root and the
-        # cookie would be scoped to it.
+        # The form action has to be what the BROWSER sees, which is not what
+        # this process sees: OnDemand's /rnode/ proxy strips its prefix before
+        # forwarding, so the request path here has no prefix at all, and a body
+        # is the one thing the proxy will not rewrite on the way back. The prefix
+        # is passed in instead, computed by an init container from the node name
+        # and the assigned NodePort -- neither of which exists until the pod is
+        # scheduled. Derived from the request path, the form would post to the
+        # OnDemand host's own root.
         action = SIGNIN_URL
 
         if has_valid_cookie(headers):
@@ -298,11 +338,13 @@ def handle(client, addr):
             supplied = (fields.get("password") or [""])[0]
             expected = read_password()
             if expected and hmac.compare_digest(supplied, expected):
-                # Path is the proxy prefix this request arrived under, so the
-                # browser sends the cookie back for every RStudio URL and for
-                # nothing else on the OnDemand host.
-                cookie_path = normalised_root()
-                redirect = (fields.get("to") or [cookie_path])[0]
+                # Both of these are what the APP is mounted at, not what the
+                # browser sees. The proxy rewrites the Location and replaces the
+                # cookie's Path with /rnode/<node>/<port>, which is what scopes
+                # the cookie to this session and to nothing else on the OnDemand
+                # host; setting that prefix here instead gets it applied twice.
+                redirect = signin_target((fields.get("to") or [""])[0])
+                cookie_path = "/"
                 log("sign-in accepted from %s" % (addr[0],))
                 client.sendall(
                     http_response(
