@@ -10,7 +10,9 @@
 #      foreign Origin
 #   4. home isolation: the R library path, RStudio's state, and a pre-existing
 #      HPC configuration left byte-identical
-#   5. the idle watchdog
+#   5. the session's ssh-agent reaching the R session
+#   6. session endings: idle, the maximum length, SIGTERM, and a missing
+#      password, each with the exit status OnDemand needs
 #
 # Usage: image/test/acceptance.sh [image-ref]
 set -uo pipefail
@@ -29,7 +31,7 @@ bad()  { printf '  FAIL %s\n' "$*"; fail=$((fail+1)); }
 head_() { printf '\n== %s ==\n' "$*"; }
 
 cleanup() {
-    podman rm -f "$NAME" "${NAME}-cull" >/dev/null 2>&1
+    podman rm -f "$NAME" "${NAME}-idle" "${NAME}-max" "${NAME}-term" "${NAME}-nopw" >/dev/null 2>&1
     # The throwaway home is written by a uid inside the container's user
     # namespace, so the host user cannot remove it directly.
     podman unshare rm -rf "$WORK" 2>/dev/null || rm -rf "$WORK" 2>/dev/null
@@ -41,7 +43,7 @@ mkdir -p "$WORK/home/.config/rstudio" "$WORK/home/R/x86_64-pc-linux-gnu-library/
          "$WORK/home/projects" "$WORK/ood"
 # The line every R user on this platform has, and the one that makes setting
 # R_LIBS_USER in the environment insufficient.
-printf 'R_LIBS_USER=/glade/u/home/ncote/R/casper/4.4\nMY_API_KEY=keepme\n' > "$WORK/home/.Renviron"
+printf 'R_LIBS_USER=/glade/u/home/jdoe/R/casper/4.4\nMY_API_KEY=keepme\n' > "$WORK/home/.Renviron"
 printf 'options(repos=c(CRAN="https://cloud.r-project.org"))\n' > "$WORK/home/.Rprofile"
 printf '{"font_size_points":14}\n' > "$WORK/home/.config/rstudio/rstudio-prefs.json"
 printf 'hpc marker\n' > "$WORK/home/R/x86_64-pc-linux-gnu-library/4.6/MARKER"
@@ -64,10 +66,10 @@ case "$synth" in
     54321:*) ok "the runtime does synthesise a numeric entry: ${synth}" ;;
     *)       printf '  note the runtime did not synthesise an entry (%s)\n' "${synth:-none}" ;;
 esac
-out="$(podman run --rm --user 54321:54321 -e HOME=/tmp/h -e USER=ncote -e GROUP=ncar \
+out="$(podman run --rm --user 54321:54321 -e HOME=/tmp/h -e USER=jdoe -e GROUP=ncar \
         "$IMAGE" bootstrap id -un 2>/dev/null)"
-[ "$out" = "ncote" ] && ok "id -un is ncote, not 54321" || bad "id -un is '${out}', expected ncote"
-out="$(podman run --rm --user 54321:54321 -e HOME=/tmp/h -e USER=ncote -e GROUP=ncar \
+[ "$out" = "jdoe" ] && ok "id -un is jdoe, not 54321" || bad "id -un is '${out}', expected jdoe"
+out="$(podman run --rm --user 54321:54321 -e HOME=/tmp/h -e USER=jdoe -e GROUP=ncar \
         "$IMAGE" bootstrap id -gn 2>/dev/null)"
 [ "$out" = "ncar" ] && ok "id -gn is ncar, not the image's own group" || bad "id -gn is '${out}', expected ncar"
 
@@ -79,17 +81,24 @@ podman run --rm --user 54321:54321 "$IMAGE" bootstrap cat /etc/passwd 2>/dev/nul
     | grep -v '^[^:]*:[^:]*:54321:' > "$WORK/passwd-noentry"
 chmod 644 "$WORK/passwd-noentry"
 out="$(podman run --rm --user 54321:54321 -v "$WORK/passwd-noentry:/etc/passwd:ro,z" \
-        -e HOME=/tmp/h -e USER=ncote -e GROUP=ncar "$IMAGE" bootstrap id -un 2>/dev/null)"
-[ "$out" = "ncote" ] && ok "id -un is ncote with no entry to start from" || bad "id -un is '${out}'"
+        -e HOME=/tmp/h -e USER=jdoe -e GROUP=ncar "$IMAGE" bootstrap id -un 2>/dev/null)"
+[ "$out" = "jdoe" ] && ok "id -un is jdoe with no entry to start from" || bad "id -un is '${out}'"
+
+out="$(podman run --rm --user 54321:54321 -e HOME=/tmp/h -e USER=jdoe -e GROUP=ncar \
+        -e CIRRUS_RSTUDIO_GECOS="$(printf 'Jane: Doe\nx:0:0')" "$IMAGE" bootstrap getent passwd jdoe 2>/dev/null)"
+fields=$(printf '%s\n' "$out" | awk -F: '{print NF}')
+[ "$(printf '%s\n' "$out" | wc -l)" = 1 ] && [ "$fields" = 7 ] \
+    && ok "GECOS with ':' and a newline gives one 7-field passwd line (${out})" \
+    || bad "GECOS broke the passwd entry: ${out}"
 
 head_ "3. the session starts and the gate holds the port"
 podman rm -f "$NAME" >/dev/null 2>&1
 podman run -d --name "$NAME" --user 54321:54321 -p "${PORT}:8080" \
-  -v "$WORK/home:/home/ncote:z" -v "$WORK/ood:/ood:z" \
-  -e HOME=/home/ncote -e USER=ncote -e NB_USER=ncote -e GROUP=ncar \
+  -v "$WORK/home:/home/jdoe:z" -v "$WORK/ood:/ood:z" \
+  -e HOME=/home/jdoe -e USER=jdoe -e NB_USER=jdoe -e GROUP=ncar \
   -e CIRRUS_RSTUDIO_PASSWORD_FILE=/ood/csenv \
   -e CIRRUS_RSTUDIO_BASE_URL_FILE=/ood/base_url \
-  -e CIRRUS_RSTUDIO_WORKDIR=/home/ncote/projects \
+  -e CIRRUS_RSTUDIO_WORKDIR=/home/jdoe/projects \
   "$IMAGE" rserver >/dev/null || { bad "container did not start"; exit 1; }
 
 start=$(date +%s)
@@ -175,7 +184,7 @@ curl -s -A "$UA" -H "Cookie: ${allcookies}" \
 if grep -q '"clientId"' "$WORK/client_init.json" 2>/dev/null; then
     ok "client_init succeeded; an R session is running"
     # RStudio reports this from its own read of ~/.Renviron. Before the site
-    # profile was in place it said /glade/u/home/ncote/R/casper/4.4 -- which was
+    # profile was in place it said /glade/u/home/jdoe/R/casper/4.4 -- which was
     # the only visible sign that the R session was ignoring everything the
     # entrypoint had set.
     reported=$(python3 -c "import json;print(json.load(open('$WORK/client_init.json'))['result'].get('r_libs_user',''))" 2>/dev/null)
@@ -299,22 +308,39 @@ else
     bad "rsession has no RS_LOG_LEVEL=warn; the Console will open with log lines"
 fi
 
+# The session's ssh-agent has to survive rserver's environment filtering, or
+# bao-getkey and ssh in the Terminal and the Git pane cannot use it.
+if podman exec "$NAME" bash -c '
+      pid=$(pgrep -x rsession | head -1); [ -n "$pid" ] || exit 9
+      sock=$(tr "\0" "\n" < /proc/$pid/environ | sed -n "s/^SSH_AUTH_SOCK=//p")
+      [ -S "$sock" ] && SSH_AUTH_SOCK=$sock ssh-add -l >/dev/null 2>&1; [ $? -eq 1 ]' 2>/dev/null; then
+    ok "rsession has SSH_AUTH_SOCK and the agent answers (no identities yet)"
+else
+    bad "rsession has no working SSH_AUTH_SOCK"
+fi
+missing=""
+for b in ssh ssh-agent ssh-add jq curl bao-getkey; do
+    podman exec "$NAME" sh -c "command -v $b" >/dev/null 2>&1 || missing="$missing $b"
+done
+[ -z "$missing" ] && ok "ssh, ssh-agent, ssh-add, jq, curl and bao-getkey are installed" \
+                  || bad "missing from the image:${missing}"
+
 podman exec "$NAME" bash -c 'R -s -e "
   lib <- .libPaths()[1]
-  cat(if (grepl(\"/home/ncote/rstudio/r-libs\", lib)) \"  ok   \" else \"  FAIL \", \"install target is \", lib, \"\n\", sep=\"\")
+  cat(if (grepl(\"/home/jdoe/rstudio/r-libs\", lib)) \"  ok   \" else \"  FAIL \", \"install target is \", lib, \"\n\", sep=\"\")
   cat(if (any(grepl(\"casper|derecho\", .libPaths()))) \"  FAIL \" else \"  ok   \", \"no HPC library path in .libPaths()\n\", sep=\"\")
   cat(if (nzchar(Sys.getenv(\"MY_API_KEY\"))) \"  ok   \" else \"  FAIL \", \"the user own ~/.Renviron settings survive\n\", sep=\"\")
 "' 2>/dev/null | grep -E "ok|FAIL"
 
 head_ "6. the home directory afterwards"
-extra=$(podman exec "$NAME" bash -c 'find /home/ncote -maxdepth 1 -mindepth 1 -printf "%f\n" | sort | tr "\n" " "')
+extra=$(podman exec "$NAME" bash -c 'find /home/jdoe -maxdepth 1 -mindepth 1 -printf "%f\n" | sort | tr "\n" " "')
 printf '  contents: %s\n' "$extra"
 case " $extra " in
     *" rstudio "*) ok "the session created \$HOME/rstudio and nothing else new" ;;
     *)             bad "\$HOME/rstudio was not created" ;;
 esac
 for d in .cache .local .config/rstudio/rstudio-desktop .rstudio; do
-    if podman exec "$NAME" test -e "/home/ncote/$d" 2>/dev/null; then
+    if podman exec "$NAME" test -e "/home/jdoe/$d" 2>/dev/null; then
         case "$d" in
             .config/rstudio/*) bad "the session wrote $d" ;;
             .cache|.local|.rstudio) bad "the session created \$HOME/$d" ;;
@@ -330,23 +356,65 @@ else
     ( cd "$WORK/home" && md5sum -c "$WORK/home-before.md5" 2>&1 | grep -v ': OK' | sed 's/^/       /' )
 fi
 
-head_ "7. idle watchdog"
-podman run -d --name "${NAME}-cull" --user 54321:54321 \
-  -v "$WORK/ood:/ood:z" -e HOME=/tmp/h -e USER=ncote -e GROUP=ncar \
-  -e CIRRUS_RSTUDIO_PASSWORD_FILE=/ood/csenv \
-  -e CIRRUS_RSTUDIO_IDLE_TIMEOUT=20 -e CIRRUS_RSTUDIO_IDLE_CHECK=5 \
-  "$IMAGE" rserver >/dev/null
-for _ in $(seq 1 24); do
-    state=$(podman inspect "${NAME}-cull" --format '{{.State.Status}}' 2>/dev/null)
-    [ "$state" = "exited" ] && break
-    sleep 5
-done
-rc=$(podman inspect "${NAME}-cull" --format '{{.State.ExitCode}}' 2>/dev/null)
-if [ "$state" = "exited" ] && [ "$rc" = "0" ]; then
-    ok "an idle session ends itself and exits 0 (so OnFailure does not restart it)"
+head_ "7. how sessions end"
+# Each ending must exit 0 when it was intended (OnDemand shows Completed, and
+# restart_policy OnFailure leaves it alone) and nonzero when it was not.
+run_session() {   # name, extra podman args...
+    local n="$1"; shift
+    podman rm -f "$n" >/dev/null 2>&1
+    podman run -d --name "$n" --user 54321:54321 -v "$WORK/ood:/ood:z" \
+        -e HOME=/tmp/h -e USER=jdoe -e GROUP=ncar \
+        -e CIRRUS_RSTUDIO_PASSWORD_FILE=/ood/csenv "$@" "$IMAGE" rserver >/dev/null
+}
+wait_exit() {     # name, max seconds -> sets state and rc
+    local i
+    for i in $(seq 1 "$2"); do
+        state=$(podman inspect "$1" --format '{{.State.Status}}' 2>/dev/null)
+        [ "$state" = "exited" ] && break
+        sleep 1
+    done
+    rc=$(podman inspect "$1" --format '{{.State.ExitCode}}' 2>/dev/null)
+}
+
+run_session "${NAME}-idle" -e CIRRUS_RSTUDIO_IDLE_TIMEOUT=20 -e CIRRUS_RSTUDIO_IDLE_CHECK=5
+wait_exit "${NAME}-idle" 90
+if [ "$state" = exited ] && [ "$rc" = 0 ] && podman logs "${NAME}-idle" 2>&1 | grep -c 'no activity for' >/dev/null; then
+    ok "an idle session ends itself, says why, and exits 0"
 else
-    bad "idle session state=${state} exit=${rc}, expected exited/0"
+    bad "idle session: state=${state} exit=${rc}"
 fi
+
+run_session "${NAME}-max" -e CIRRUS_RSTUDIO_IDLE_TIMEOUT=0 -e CIRRUS_RSTUDIO_IDLE_CHECK=5 \
+    -e CIRRUS_RSTUDIO_MAX_SECONDS=15
+wait_exit "${NAME}-max" 60
+if [ "$state" = exited ] && [ "$rc" = 0 ] && podman logs "${NAME}-max" 2>&1 | grep -c 'maximum length' >/dev/null; then
+    ok "a session at its maximum length ends and exits 0"
+else
+    bad "maximum length: state=${state} exit=${rc}"
+fi
+
+run_session "${NAME}-term"
+sleep 8
+podman stop -t 20 "${NAME}-term" >/dev/null 2>&1
+wait_exit "${NAME}-term" 30
+if [ "$rc" = 0 ] && podman logs "${NAME}-term" 2>&1 | grep -c 'received SIGTERM' >/dev/null; then
+    ok "SIGTERM (ending it from the dashboard) stops RStudio and exits 0"
+else
+    bad "SIGTERM: exit=${rc}"
+fi
+
+mkdir -p "$WORK/ood-empty" && : > "$WORK/ood-empty/csenv" && chmod -R 755 "$WORK/ood-empty"
+podman rm -f "${NAME}-nopw" >/dev/null 2>&1
+podman run -d --name "${NAME}-nopw" --user 54321:54321 -v "$WORK/ood-empty:/ood:z" \
+    -e HOME=/tmp/h -e USER=jdoe -e CIRRUS_RSTUDIO_PASSWORD_FILE=/ood/csenv \
+    -e CIRRUS_RSTUDIO_CONFIG_WAIT=5 "$IMAGE" rserver >/dev/null
+wait_exit "${NAME}-nopw" 30
+if [ "$rc" != 0 ] && podman logs "${NAME}-nopw" 2>&1 | grep -c 'ERROR: this session cannot start' >/dev/null; then
+    ok "no password after the wait: a clear error and a nonzero exit (${rc})"
+else
+    bad "missing password: exit=${rc}"
+fi
+podman logs "${NAME}-nopw" 2>&1 | grep 'cirrus-rstudio: ' | tail -4 | sed 's/^/       /'
 
 head_ "versions recorded in the image"
 podman run --rm "$IMAGE" bootstrap rstudio-versions 2>/dev/null | grep -v '^#' | sed 's/^/  /'

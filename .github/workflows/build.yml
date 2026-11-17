@@ -51,6 +51,48 @@ jobs:
             -f image/Dockerfile \
             image
 
+      # Runs as an arbitrary uid, the way OnDemand runs the pod, and fails the
+      # build before anything is pushed.
+      - name: Smoke test
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker run --rm --user 54321:54321 -e HOME=/tmp/h -e USER=jdoe \
+            --entrypoint /usr/local/bin/entrypoint.sh "$IMAGE" bootstrap bash -c '
+              set -euo pipefail
+              for b in rserver R ssh ssh-agent ssh-add jq curl git bao-getkey cirrus-rstudio-gate; do
+                command -v "$b" >/dev/null || [ -x /usr/lib/rstudio-server/bin/$b ] \
+                  || { echo "MISSING: $b"; exit 1; }
+              done
+              echo "9fee1714bd7b149dec56798304350642167cae3eb9236aecfbc44fd39dc7bf9e  /usr/local/bin/bao-getkey" \
+                | sha256sum -c --quiet
+              [ "$(id -un)" = jdoe ] || { echo "uid has no user name"; exit 1; }
+              # The per-session agent the entrypoint starts for bao-getkey.
+              eval "$(ssh-agent -a /tmp/agent.sock)" >/dev/null
+              set +e; ssh-add -l >/dev/null 2>&1; rc=$?; set -e
+              [ "$rc" = 1 ] || { echo "ssh-agent unreachable (ssh-add -l exit $rc)"; exit 1; }
+              echo "smoke test OK"
+            '
+          # A real session: the gate must come up and serve its login page.
+          mkdir -p ood && printf 'password=smoke\n' > ood/csenv && chmod -R a+rX ood
+          docker run -d --name smoke --user 54321:54321 -p 18080:8080 \
+            -v "$PWD/ood:/ood:ro" -e HOME=/tmp/h -e USER=jdoe \
+            -e CIRRUS_RSTUDIO_PASSWORD_FILE=/ood/csenv "$IMAGE" rserver
+          for _ in $(seq 1 60); do
+            curl -fs -o /dev/null http://127.0.0.1:18080/ && break
+            sleep 1
+          done
+          curl -fs http://127.0.0.1:18080/ | grep -q 'Session password' \
+            || { docker logs smoke; exit 1; }
+          docker exec smoke bash -c 'SSH_AUTH_SOCK=/tmp/cirrus-rstudio/ssh-agent.sock ssh-add -l; [ $? = 1 ]' \
+            || { docker logs smoke; exit 1; }
+          docker stop -t 20 smoke >/dev/null
+          rc="$(docker inspect smoke --format '{{.State.ExitCode}}')"
+          docker rm smoke >/dev/null
+          [ "$rc" = 0 ] || { echo "SIGTERM gave exit $rc, expected 0"; exit 1; }
+          echo "session smoke test OK"
+
       - name: Push image to Harbor
         env:
           IMAGE: ${{ steps.ref.outputs.image }}

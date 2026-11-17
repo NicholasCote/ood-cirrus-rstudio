@@ -1,8 +1,8 @@
 <%- workdir = user_context["working_dir"].to_s.strip -%>
 <%- unless workdir.empty? -%>
-**Opens in:** `<%= workdir %>`
+**Opens in:** `<%= ERB::Util.html_escape(workdir) %>`
 <%- end -%>
 
-R packages you install go to `~/rstudio/r-libs/`, and your RStudio settings to
-`~/rstudio/config/`. Neither is the library or the configuration your Casper and
-Derecho sessions use — packages built in this container will not load there.
+R packages you install go to `~/rstudio/r-libs/` and your RStudio settings to
+`~/rstudio/config/`, separate from your Casper and Derecho R setup: packages
+built in this container will not load there.

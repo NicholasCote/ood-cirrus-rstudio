@@ -14,11 +14,12 @@ attributes:
     required: false
     help: |
       Absolute path RStudio opens in the Files pane and starts the console in.
-      Leave blank for your home directory. Only your home directory is mounted
-      into the session, so this must be a path underneath it.
+      Leave blank for your home directory. Your home, /glade/work,
+      /glade/campaign (read-only), /glade/collections and /gdex are mounted,
+      so it should be a path under one of those.
 
-      This is only where the editor opens. Your RStudio settings and your
-      installed R packages always live in `~/rstudio/`, whatever you put here.
+      Sessions end after **1 hour with no activity** and after **12 hours** in
+      any case. Your files, installed R packages and RStudio settings are kept.
 
   cpu:
     widget: number_field

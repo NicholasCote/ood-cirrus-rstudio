@@ -1,26 +1,21 @@
-# CIRRUS RStudio session environment for login shells.
-#
-# RStudio spawns its Terminal tab as `bash --login --posix`, and in POSIX mode
-# bash expands \u from the uid rather than from the passwd entry -- verified:
-#
-#   $ bash          -c 'PS1="\u"; printf %s "${PS1@P}"'   ->  ncote
-#   $ bash --posix  -c 'PS1="\u"; printf %s "${PS1@P}"'   ->  54321
-#
-# with nss_wrapper active and `whoami` answering ncote in both. So the prompt
-# alone would read as a broken session while everything else worked. $USER is
-# set correctly by the entrypoint, so use it.
-#
-# Only for interactive shells, and only when the default prompt is still in
-# place: anyone who sets PS1 in their own ~/.profile or ~/.bashrc means it.
+# CIRRUS RStudio session environment for login shells (the Terminal tab).
+
+# The session's ssh-agent, for bao-getkey and ssh to Casper/Derecho. It normally
+# arrives through the environment (bin/cirrus-rsession); this is a fallback for
+# a shell that lost it. Only when unset, so a user's own agent is left alone.
+if [ -z "${SSH_AUTH_SOCK:-}" ] && [ -S "${CIRRUS_RSTUDIO_STATE_DIR:-/tmp/cirrus-rstudio}/ssh-agent.sock" ]; then
+    SSH_AUTH_SOCK="${CIRRUS_RSTUDIO_STATE_DIR:-/tmp/cirrus-rstudio}/ssh-agent.sock"
+    export SSH_AUTH_SOCK
+fi
+
+# Show the user name in the prompt. With the uid mapped through nss_wrapper,
+# bash's \u can render as the bare uid, which looks like a broken session.
+# Only the stock prompts are replaced; a PS1 the user set is left alone.
 case "$-" in
     *i*)
         case "${PS1:-}" in
-            # bash's stock prompts, and the Ubuntu default. Anything else is the
-            # user's and is left alone.
             '\s-\v\$ '|'\s-\v\$'|'\u@\h:\w\$ '|'\h:\w\$ '|'$ '|'')
-                if [ -n "${USER:-}" ]; then
-                    PS1="${USER}@\h:\w\$ "
-                fi
+                [ -n "${USER:-}" ] && PS1="${USER}@\h:\w\$ "
                 ;;
         esac
         ;;

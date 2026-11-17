@@ -1,34 +1,44 @@
 <%-
-  # ---------------------------------------------------------------------------
-  # The image. Fixed here, not offered on the form: which container RStudio runs
-  # in is not a decision someone opening an editor should have to make, and a
-  # wrong answer produces a session that dies instantly.
-  #
-  # Pinned to an explicit tag. CI publishes date tags (%Y-%m-%d.%H.%M); bump this
-  # to the tag you have tested, never to something floating.
-  # ---------------------------------------------------------------------------
+  # The image is fixed here, not offered on the form. CI publishes date tags
+  # (%Y-%m-%d.%H.%M); pin one you have tested, never a floating tag.
   rstudio_img = "hub.k8s.ucar.edu/ncote/rstudio-server:2026-08-21.16.02"
 
   utility_img = "docker.io/ohiosupercomputer/ood-k8s-utils:latest"
 
   user = OodSupport::User.new
 
+  # A session ends after idle_timeout with no activity, or after
+  # max_session_hours no matter what. Enforced by the image's entrypoint.
   idle_timeout = 3600
   idle_check_interval = 300
-
   max_session_hours = 12
+
+  # Validated here, not just by the form's min/max: the browser's limits are
+  # advisory, and these values end up in the pod spec.
+  whole_number = lambda do |label, raw, range|
+    s = raw.to_s.strip
+    unless s.match?(/\A\d{1,3}\z/) && range.cover?(s.to_i)
+      raise "#{label} must be a whole number from #{range.min} to #{range.max}, got #{raw.to_s.inspect}."
+    end
+    s.to_i
+  end
+  cpus = whole_number.call("CPUs", cpu, 1..8)
+  memory_gb = whole_number.call("Memory (GB)", memory, 1..32)
 
   workdir = working_dir.to_s.strip
   workdir = user.home if workdir.empty?
-
   unless workdir.match?(%r{\A/[A-Za-z0-9 ._\-/]{0,1023}\z})
     raise "Invalid working directory: #{workdir.inspect}. " \
           "Expected an absolute path built from letters, digits, spaces, " \
           "'.', '_', '-', and '/'."
   end
 
-  base_url_file = "base_url"
+  # Free text from the site user database, written into the session's passwd
+  # entry (git uses it as the default author name). ':' or a newline would
+  # corrupt that line, and '"' or '\' would break the YAML it travels in.
+  gecos = user.gecos.to_s.gsub(/[[:cntrl:]:"\\]/, " ").squeeze(" ").strip
 
+  base_url_file = "base_url"
   passwd_file = "csenv"
 -%>
 ---
@@ -48,21 +58,20 @@ script:
         USER: "<%= user.name %>"
         NB_USER: "<%= user.name %>"
         GROUP: "<%= user.group.name %>"
-
+        CIRRUS_RSTUDIO_GECOS: "<%= gecos %>"
         CIRRUS_RSTUDIO_WORKDIR: "<%= workdir %>"
-
         CIRRUS_RSTUDIO_PORT: "8080"
-
         CIRRUS_RSTUDIO_AUTH: "password"
         CIRRUS_RSTUDIO_PASSWORD_FILE: "/ood/<%= passwd_file %>"
-
         CIRRUS_RSTUDIO_BASE_URL_FILE: "/ood/<%= base_url_file %>"
-
         CIRRUS_RSTUDIO_IDLE_TIMEOUT: "<%= idle_timeout %>"
         CIRRUS_RSTUDIO_IDLE_CHECK: "<%= idle_check_interval %>"
+        CIRRUS_RSTUDIO_MAX_SECONDS: "<%= max_session_hours * 3600 %>"
       port: 8080
-      cpu: "<%= cpu.to_i %>"
-      memory: "<%= memory.to_i %>Gi"
+      cpu: "<%= cpus %>"
+      memory: "<%= memory_gb %>Gi"
+      # The entrypoint keeps the port closed until the init containers have
+      # written the password and proxy prefix; allow up to 5 minutes.
       startup_probe:
         initial_delay_seconds: 5
         failure_threshold: 60
@@ -111,6 +120,10 @@ script:
           - "/bin/bash"
           - "-c"
           - "source /bin/passwd_from_secret; kubectl patch configmap $(hostname)-configmap --type=merge -p 'data: {<%= passwd_file %>: password='$PASSWORD'}'"
+      # The proxy prefix /rnode/<node>/<nodePort>/ only exists once the pod is
+      # scheduled and its service has a NodePort, so it is computed here. The
+      # gate's login form needs it (response bodies are not rewritten by the
+      # proxy).
       - name: "add-baseurl-to-cfg"
         image: "<%= utility_img %>"
         command:

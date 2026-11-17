@@ -1,66 +1,24 @@
 #!/usr/bin/env python3
-r"""Per-session password gate in front of RStudio Server.
+"""Per-session password gate in front of RStudio Server.
 
-Why this exists
----------------
-RStudio Server cannot authenticate anyone when it is not running as root, and
-this session is not: the pod runs as the user's real NFS uid so that files
-written to GLADE belong to them.
+Running as the user's own uid (not root), rserver cannot authenticate anyone:
+requesting its sign-in page signs the caller straight in. So this process holds
+the public port, checks the session password once per connection, sets a
+cookie, and then relays bytes to an rserver bound to loopback. Relaying whole
+connections is what keeps RStudio's websockets working.
 
-Verified against the rserver in this image (2026.08.1+195), with a PAM helper
-configured and with every auth setting left at its default:
+Behind OnDemand's /rnode/ proxy the prefix is stripped on the way in and added
+back to every Location header and cookie Path on the way out, so redirects and
+cookies here are unprefixed. Only the login form's action (a response body,
+which the proxy does not rewrite) carries the prefix, from
+CIRRUS_RSTUDIO_ROOT_PATH.
 
-    $ curl -c jar 'http://.../auth-sign-in?appUri=%2F'
-    HTTP/1.1 302 Moved Temporarily
-    Set-Cookie: user-id=ncote|...
-
-No password was sent, no login form was served, and the helper at
---auth-pam-helper-path was never executed -- there is no line from it anywhere
-in the log. That is not a misconfiguration: running without privilege, rserver
-cannot switch to any user other than the one it already is, so there is nothing
-for it to authenticate and it signs the caller straight in. Requesting the
-sign-in page IS the sign-in.
-
-So the choice was between --auth-none=1 (which is what the above amounts to,
-just stated honestly) and putting the check somewhere that can enforce it. This
-is that somewhere: it holds the port, checks the session password once per
-connection, and relays bytes to an rserver bound to loopback.
-
-Design notes
-------------
-* Pure standard library. Adding a Python web framework to an R image to guard
-  one password would be a poor trade, and every dependency here is another thing
-  for Harbor's scanner to report.
-
-* The check is per *connection*, on the first request only, and afterwards the
-  connection is a blind byte relay. That is what keeps websockets working:
-  RStudio's console and terminal both upgrade, and an upgraded connection is no
-  longer HTTP to parse. A browser sends its cookies on the websocket handshake
-  like any other request, so the handshake is checked exactly like a GET.
-
-* It never rewrites a body, a header, or a path, and it deliberately does not
-  put the proxy prefix into anything the proxy will handle itself. OnDemand's
-  /rnode/ block does both halves:
-
-      Header edit Location "^([^/]+//[^/]+)|(?=/)|^([\./]{1,}(?<!/))" \
-                           "/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
-      Header edit* Set-Cookie ";\s*(?i)Path[^;]*" ""
-      Header edit  Set-Cookie "^([^;]+)" "$1; Path=/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
-
-  -- it strips the prefix on the way in, and prepends it to every Location and
-  rewrites every cookie Path on the way out. So the 302 this process sends after
-  a successful sign-in has to be plain "/". Sent as /rnode/<node>/<port>/ it
-  arrives at the browser as /rnode/<node>/<port>/rnode/<node>/<port>/, which is
-  a 404 on the dashboard -- the first thing this app did in OnDemand.
-
-  What the proxy does NOT rewrite is response bodies. The login form's action is
-  in a body, and the browser resolves it against the OnDemand host, so that one
-  string does need the full prefix -- and that is the only reason
-  CIRRUS_RSTUDIO_ROOT_PATH exists.
+Standard library only.
 """
 
 import base64
 import hmac
+import html
 import os
 import re
 import secrets
@@ -318,14 +276,7 @@ def handle(client, addr):
             client.sendall(http_response("400 Bad Request", "<h1>Bad request</h1>"))
             return
         method, path, headers = parsed
-        # The form action has to be what the BROWSER sees, which is not what
-        # this process sees: OnDemand's /rnode/ proxy strips its prefix before
-        # forwarding, so the request path here has no prefix at all, and a body
-        # is the one thing the proxy will not rewrite on the way back. The prefix
-        # is passed in instead, computed by an init container from the node name
-        # and the assigned NodePort -- neither of which exists until the pod is
-        # scheduled. Derived from the request path, the form would post to the
-        # OnDemand host's own root.
+        # The prefixed URL the browser sees; the request path here has none.
         action = SIGNIN_URL
 
         if has_valid_cookie(headers):
@@ -338,18 +289,15 @@ def handle(client, addr):
             supplied = (fields.get("password") or [""])[0]
             expected = read_password()
             if expected and hmac.compare_digest(supplied, expected):
-                # Both of these are what the APP is mounted at, not what the
-                # browser sees. The proxy rewrites the Location and replaces the
-                # cookie's Path with /rnode/<node>/<port>, which is what scopes
-                # the cookie to this session and to nothing else on the OnDemand
-                # host; setting that prefix here instead gets it applied twice.
+                # Unprefixed: the proxy adds /rnode/<node>/<port> to both the
+                # Location and the cookie Path itself.
                 redirect = signin_target((fields.get("to") or [""])[0])
                 cookie_path = "/"
                 log("sign-in accepted from %s" % (addr[0],))
                 client.sendall(
                     http_response(
                         "302 Found",
-                        "<a href=\"%s\">RStudio</a>" % redirect,
+                        "<a href=\"%s\">RStudio</a>" % html.escape(redirect),
                         (
                             "Location: %s" % redirect,
                             "Set-Cookie: %s=%s; Path=%s; HttpOnly; SameSite=Lax"
