@@ -2,6 +2,12 @@ name: Build and push RStudio Server image
 
 on:
   workflow_dispatch:
+    inputs:
+      skip_bump:
+        description: "Build and push, but do not pin the new tag in submit.yml.erb"
+        required: false
+        type: boolean
+        default: false
   push:
     paths:
       - image/**
@@ -9,8 +15,13 @@ on:
     branches:
       - main
 
+# Two builds racing would each pin their own tag; run them one at a time.
+concurrency:
+  group: build-rstudio-image
+  cancel-in-progress: false
+
 permissions:
-  contents: read
+  contents: write   # to commit the new tag back to submit.yml.erb
 
 jobs:
   build-push:
@@ -18,11 +29,12 @@ jobs:
     steps:
       - name: Checkout the repo
         uses: actions/checkout@v4
+        with:
+          # Full history, so the pin commit can be rebased if main moved.
+          fetch-depth: 0
 
-      # One place the tag is computed, one place the full reference is
-      # assembled. The build, the push and the summary all read this output, so
-      # the reference pasted into submit.yml.erb cannot drift from the one that
-      # was pushed -- which it could when each step spelled it out again.
+      # The one place the reference is assembled; build, push, pin and
+      # summary all read it.
       - name: Compose the image reference
         id: ref
         run: |
@@ -39,9 +51,6 @@ jobs:
           username: ${{ secrets.HARBOR_LOGIN }}
           password: ${{ secrets.HARBOR_SECRET }}
 
-      # The image lives in a subdirectory, so the build context and the
-      # Dockerfile are both named explicitly. OOD ignores image/ entirely -- it
-      # reads the app files at the repo root.
       - name: Build image
         env:
           IMAGE: ${{ steps.ref.outputs.image }}
@@ -94,23 +103,58 @@ jobs:
           echo "session smoke test OK"
 
       - name: Push image to Harbor
+        id: push
         env:
           IMAGE: ${{ steps.ref.outputs.image }}
         run: docker push "$IMAGE"
 
-      # The reference is the one thing anybody wants out of a green run: nothing
-      # uses the new image until it is pinned in submit.yml.erb by hand. A job
-      # summary is one click from the run page and holds a copyable block; a log
-      # line is neither. The ::notice puts it at the top of the run page too.
+      # Only after a smoke-tested push, and only from main: a manual run on
+      # another branch must never repin what users get. The commit touches
+      # only submit.yml.erb, which is outside the paths that trigger this
+      # workflow, so it cannot start another build.
+      - name: Pin the new tag in submit.yml.erb
+        id: pin
+        if: ${{ github.ref == 'refs/heads/main' && !inputs.skip_bump }}
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          set -euo pipefail
+          python3 - "$IMAGE" <<'PY'
+          import pathlib, re, sys
+          ref = sys.argv[1]
+          p = pathlib.Path("submit.yml.erb")
+          new, n = re.subn(r'^(\s*rstudio_img\s*=\s*)".*"$',
+                           lambda m: f'{m.group(1)}"{ref}"', p.read_text(), count=1, flags=re.M)
+          if n != 1:
+              sys.exit("could not find a single rstudio_img assignment in submit.yml.erb")
+          p.write_text(new)
+          PY
+          if git diff --quiet -- submit.yml.erb; then
+            echo "rstudio_img already at ${IMAGE}; nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add submit.yml.erb
+          git commit -m "Pin rstudio_img to ${IMAGE##*:} [skip ci]"
+          # main may have moved during the build; replay the one-line change.
+          for _ in 1 2 3; do
+            git pull --rebase --quiet origin main && git push origin HEAD:main && exit 0
+            sleep 5
+          done
+          echo "::error::Pushed ${IMAGE} but could not commit the pin to main."
+          exit 1
+
       - name: Summarise the pushed image
+        if: ${{ always() && steps.push.outcome == 'success' }}
         env:
           IMAGE: ${{ steps.ref.outputs.image }}
           TAG: ${{ steps.ref.outputs.tag }}
+          PIN_OUTCOME: ${{ steps.pin.outcome }}
         run: |
           echo "::notice title=Image pushed::${IMAGE}"
 
-          # Both of these are read back from what was actually built rather than
-          # assumed, and neither is worth failing an otherwise green build over.
+          # Read back from the built image; never worth failing the run over.
           digest="$(docker image inspect \
               --format '{{ if .RepoDigests }}{{ index .RepoDigests 0 }}{{ end }}' \
               "$IMAGE" 2>/dev/null || true)"
@@ -124,11 +168,12 @@ jobs:
             echo "${IMAGE}"
             echo '```'
             echo
-            echo "Pin it in \`submit.yml.erb\`, in the \`rstudio_img\` line near the top:"
-            echo
-            echo '```ruby'
-            echo "  rstudio_img = \"${IMAGE}\""
-            echo '```'
+            case "${PIN_OUTCOME}" in
+              success) echo "Pinned in \`submit.yml.erb\` on \`main\`; new sessions use it once OnDemand has the update." ;;
+              skipped) echo "Not pinned (manual run with skip_bump, or not on main). To use it, set in \`submit.yml.erb\`:"
+                       echo; echo '```ruby'; echo "  rstudio_img = \"${IMAGE}\""; echo '```' ;;
+              *)       echo "**Pinning failed** (${PIN_OUTCOME:-not run}); \`submit.yml.erb\` still has the previous image." ;;
+            esac
             if [ -n "$digest" ]; then
               echo
               echo "Digest: \`${digest#*@}\`"

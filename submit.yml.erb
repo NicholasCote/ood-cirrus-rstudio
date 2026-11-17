@@ -1,7 +1,9 @@
 <%-
-  # The image is fixed here, not offered on the form. CI publishes date tags
-  # (%Y-%m-%d.%H.%M); pin one you have tested, never a floating tag.
-  rstudio_img = "hub.k8s.ucar.edu/ncote/rstudio-server:2026-08-21.16.02"
+  # The image is fixed here, not offered on the form. This line is rewritten
+  # by CI (.github/workflows/build.yml) after each smoke-tested image push, so
+  # edit image/ and let the workflow update it; roll back by reverting the
+  # commit that changed it.
+  rstudio_img = "hub.k8s.ucar.edu/ncote/rstudio-server:2026-11-17.23.43"
 
   utility_img = "docker.io/ohiosupercomputer/ood-k8s-utils:latest"
 

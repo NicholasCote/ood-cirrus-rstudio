@@ -220,12 +220,17 @@ unauthenticated build cannot fetch it. It is a verbatim copy of
 checks its sha256. To update it, copy the file again and update the hash in
 the Dockerfile comment and the workflow.
 
-CI runs on pushes to `main` touching `image/` and on demand. It builds, runs a
-smoke test as an arbitrary uid (tools present, `bao-getkey` hash, the
-session's ssh-agent reachable, the gate serving its login page, SIGTERM exiting
-0), then pushes `hub.k8s.ucar.edu/ncote/rstudio-server:<date tag>`. **The tag
-in `submit.yml.erb` is updated by hand**; the run's summary has the line to
-paste. Harbor scans pushed images with Trivy.
+CI runs on pushes to `main` touching `image/` or the workflow, and on demand.
+It builds, runs a smoke test as an arbitrary uid (tools present, `bao-getkey`
+hash, the session's ssh-agent reachable, the gate serving its login page,
+SIGTERM exiting 0), pushes `hub.k8s.ucar.edu/ncote/rstudio-server:<date tag>`,
+and then commits the new tag into `rstudio_img` in `submit.yml.erb` on `main`.
+So **don't hand-edit `rstudio_img`**: change `image/` and let the workflow pin
+it. To roll back, revert the pin commit. A manual run with `skip_bump` builds
+and pushes without pinning. Harbor scans pushed images with Trivy.
+
+The first launch after a new tag pulls the image cold and is slow once, which
+is worth knowing before a demo.
 
 `rstudio-versions` in the image prints the versions recorded at build time.
 
